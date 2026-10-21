@@ -1,0 +1,52 @@
+<!doctype html><meta charset=utf-8><style>
+body{width:210px;background:#111;color:#eee;font:12px system-ui;padding:10px}
+#s{font-size:2.4em;font-weight:700}
+#s.hunt{color:#2b6}
+@keyframes pop{0%{transform:scale(1)}30%{transform:scale(1.15)}100%{transform:scale(1)}}
+#s.pulse{animation:pop .35s}
+#cap{font-size:10px;color:#888}
+#lv,#eip{font-size:10px;color:#777}
+#lv{display:none}
+#r{font-size:11px;color:#9a9;min-height:1.2em}
+#p{font-size:11px;color:#6c8;min-height:1.1em}
+#st{font-size:10px;color:#888;min-height:1.2em;word-break:break-all}
+#lg{font-size:10px;color:#666;min-height:2.4em;display:-webkit-box;
+ -webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.sr{display:flex;justify-content:space-between;align-items:center;
+ font-size:11px;margin:4px 0;color:#bbb}
+.sw{position:relative;width:26px;height:15px;flex:none}
+.sw input{display:none}
+.sl{position:absolute;inset:0;background:#555;border-radius:15px;
+ transition:.2s;cursor:pointer}
+.sl:before{content:'';position:absolute;width:11px;height:11px;left:2px;
+ top:2px;background:#fff;border-radius:50%;transition:.2s}
+input:checked+.sl{background:#2b6}
+input:checked+.sl:before{transform:translateX(11px)}
+select{font-size:10px;max-width:110px;background:#222;color:#bbb;border:0}
+#vs{cursor:pointer;color:#6c8;font-size:10px;margin-left:5px}
+button{width:100%;margin:3px 0;padding:6px;border:0;border-radius:6px;
+ background:#2b6;color:#fff;cursor:pointer;font-size:12px}
+button.sec{background:#555}
+button:disabled{opacity:.4;cursor:default}
+@media(prefers-color-scheme:light){
+body{background:#f4f4f4;color:#222}
+#s.hunt{color:#1a8a4a}
+#cap,#st{color:#666}#r{color:#4a7}#lg,#lv,#eip{color:#888}.sr{color:#444}
+.sl{background:#bbb}select{background:#e4e4e4;color:#333}
+button.sec{background:#999}}
+</style>
+<div id=s><span id=sv>–</span></div>
+<div id=cap></div>
+<div id=lv></div>
+<div id=eip></div>
+<div id=r>–</div>
+<div id=p></div>
+<div id=st>torspeed</div>
+<div id=lg></div>
+<div class=sr><span id=dl></span><span><select id=ds></select><a id=vs></a></span></div>
+<div class=sr><span id=tl></span><label class=sw><input type=checkbox id=tc><span class=sl></span></label></div>
+<div class=sr><span id=vl></span><label class=sw><input type=checkbox id=vc><span class=sl></span></label></div>
+<button id=h></button>
+<button class=sec id=n></button>
+<button class=sec id=m></button>
+<script src=popup.js></script>

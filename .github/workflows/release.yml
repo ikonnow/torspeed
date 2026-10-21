@@ -1,0 +1,37 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # runs the full check suite, then cross-compiles all binaries
+      # stamped with the tag as version
+      - run: make release
+
+      - name: create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            torspeed-darwin-arm64 torspeed-darwin-amd64 \
+            torspeed-linux-amd64 torspeed-linux-arm64 \
+            torspeed-windows-amd64.exe \
+            --title "torspeed ${{ github.ref_name }}" \
+            --generate-notes

@@ -1,0 +1,4 @@
+# built binaries
+torspeed
+torspeed-*
+*.exe
