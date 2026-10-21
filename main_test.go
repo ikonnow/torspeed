@@ -890,8 +890,11 @@ func TestProxyStateCache(t *testing.T) {
 		return true
 	}
 	proxyStateInvalidate()
-	if !proxyState() || !proxyState() {
+	if !proxyState() {
 		t.Fatal("proxyState should return stubbed true")
+	}
+	if !proxyState() {
+		t.Fatal("proxyState should return stubbed true (cached)")
 	}
 	if n := atomic.LoadInt32(&calls); n != 1 {
 		t.Fatalf("probe called %d times for 2 calls, want 1", n)
