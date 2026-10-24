@@ -34,7 +34,9 @@
   checked against the pinned candidate (stale conflux sets can carry
   the previous exit) and always closed again.
 - **Boost**: optional background optimizer keeps sampling exits on the
-  probe daemon; switches the pin only at ≥15 % confirmed improvement,
+  probe daemon; switches the pin only at ≥15 % confirmed improvement
+  over the incumbent's *proven peak* (decays after 30 min) – a
+  congested retest can no longer hand the pin to a worse exit;
   prunes everything without potential, backs off 20 s → 5 min, and
   stops itself after 60 min without improvement. Toggle in the
   popup/dashboard or `POST /api/boost?on=0|1`.

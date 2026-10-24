@@ -1478,7 +1478,7 @@ func TestBoardSwitchTo(t *testing.T) {
 func TestBoardSeed(t *testing.T) {
 	b := newBoard()
 	now := time.Now()
-	b.seed("W", []exitScore{
+	b.seed("W", 21, []exitScore{
 		{fp: "W", name: "w", vals: []float64{20, 22}, mean: 21},
 		{fp: "L", name: "l", vals: []float64{3}, mean: 3},
 	}, now)
@@ -1490,6 +1490,54 @@ func TestBoardSeed(t *testing.T) {
 	}
 	if _, n := b.mean("L"); n != 0 {
 		t.Fatal("low seed contender should be cooled by prune")
+	}
+}
+
+// TestBoardSwitchToPeak: a degraded incumbent must not be replaced by
+// a contender that only beats the degraded mean – the proven peak is
+// the bar until it decays (peakHold).
+func TestBoardSwitchToPeak(t *testing.T) {
+	now := time.Now()
+	b := newBoard()
+	b.seed("INC", 12.2, []exitScore{
+		{fp: "INC", name: "inc", vals: []float64{12.2}, mean: 12.2},
+	}, now)
+	b.add("INC", "inc", 7.0, now) // congested retest: mean 9.6
+	b.add("W", "worse", 8.7, now)
+	b.add("W", "worse", 8.7, now) // beats 1.15*9.6 but not the peak
+	if fp, ok := b.switchTo(now, now.Add(-time.Hour)); ok {
+		t.Fatalf("switched to worse exit %q below the proven peak", fp)
+	}
+	b.add("G", "good", 13.0, now)
+	b.add("G", "good", 13.0, now) // 13 ≥ 1.15*10.98
+	if fp, ok := b.switchTo(now, now.Add(-time.Hour)); !ok || fp != "G" {
+		t.Fatalf("switchTo = %q %v, want G", fp, ok)
+	}
+	later := now.Add(peakHold + time.Minute)
+	b3 := newBoard()
+	b3.seed("INC", 12.2, nil, now)
+	b3.add("INC", "inc", 7.0, now)
+	b3.add("F", "f", 9.0, now)
+	b3.add("F", "f", 9.0, now) // 9 ≥ 1.15*7 – peak decayed
+	if fp, ok := b3.switchTo(later, now.Add(-time.Hour)); !ok || fp != "F" {
+		t.Fatalf("after peak decay switchTo = %q %v, want F", fp, ok)
+	}
+}
+
+// TestBoardCooldownIncumbent: a failed incumbent retest must never
+// wipe its stats or park it.
+func TestBoardCooldownIncumbent(t *testing.T) {
+	b := newBoard()
+	now := time.Now()
+	b.seed("INC", 10, []exitScore{
+		{fp: "INC", name: "inc", vals: []float64{10}, mean: 10},
+	}, now)
+	b.cooldown("INC", now)
+	if m, n := b.mean("INC"); m != 10 || n != 1 {
+		t.Fatalf("incumbent cooled: mean %v n %d", m, n)
+	}
+	if _, ok := b.cool["INC"]; ok {
+		t.Fatal("incumbent got a cool entry")
 	}
 }
 

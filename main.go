@@ -2144,7 +2144,7 @@ func (s *server) startHunt() {
 			if s.board == nil {
 				s.board = newBoard()
 			}
-			s.board.seed(best.fp, results, time.Now())
+			s.board.seed(best.fp, best.mean, results, time.Now())
 			s.mu.Unlock()
 			s.startBoost()
 		}
@@ -2410,7 +2410,9 @@ func (s *server) probeFor(timeout time.Duration) *daemon {
 // Everything worse than the incumbent – or without potential – goes away.
 const (
 	potentialRatio = 0.8              // contender mean below this × incumbent → drop
-	switchRatio    = 1.15             // switch only at this × incumbent mean
+	switchRatio    = 1.15             // switch only at this × incumbent reference
+	peakRatio      = 0.9              // incumbent's proven peak × this counts as reference
+	peakHold       = 30 * time.Minute // the peak holds this long, then decays
 	coolDur        = 30 * time.Minute // stay dropped this long
 	sampleTTL      = 20 * time.Minute // samples older than this don't count
 	minSwitchGap   = 2 * time.Minute  // min time between exit switches
@@ -2426,11 +2428,13 @@ type exitStat struct {
 // board tracks what the boost loop learned: the incumbent pin, per-exit
 // samples and cooled rejects. All methods are mutex-guarded.
 type board struct {
-	mu    sync.Mutex
-	inc   string
-	stats map[string]*exitStat
-	cool  map[string]time.Time // fp → cooled until
-	names map[string]string    // fp → nickname (survives sample expiry)
+	mu         sync.Mutex
+	inc        string
+	incScore   float64   // score the incumbent won with – the bar to beat
+	incScoreAt time.Time // the peak decays after peakHold
+	stats      map[string]*exitStat
+	cool       map[string]time.Time // fp → cooled until
+	names      map[string]string    // fp → nickname (survives sample expiry)
 }
 
 func newBoard() *board {
@@ -2527,10 +2531,15 @@ func (b *board) prune(now time.Time) {
 	b.pruneLocked(now)
 }
 
-// cooldown drops an exit's stats and parks it for coolDur.
+// cooldown drops a contender's stats and parks it for coolDur. The
+// incumbent is never cooled – a failed retest must not wipe the
+// reference the boost switches are measured against.
 func (b *board) cooldown(fp string, now time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if fp == b.inc {
+		return
+	}
 	delete(b.stats, fp)
 	b.cool[fp] = now.Add(coolDur)
 }
@@ -2541,10 +2550,11 @@ func (b *board) incumbent() string {
 	return b.inc
 }
 
-func (b *board) setInc(fp string) {
+// setInc crowns a new incumbent and remembers the score it won with.
+func (b *board) setInc(fp string, score float64, now time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.inc = fp
+	b.inc, b.incScore, b.incScoreAt = fp, score, now
 }
 
 func (b *board) nameOf(fp string) string {
@@ -2595,9 +2605,24 @@ func (b *board) next(pool []relay, round int, now time.Time) (relay, bool) {
 	return fresh[mrand.Intn(len(fresh))], true
 }
 
+// incRef is the bar a contender must beat: the incumbent's current
+// mean, or – while the peak still counts – its proven score ×
+// peakRatio, whichever is higher. Without it, a congested retest would
+// let a challenger win against the degraded mean and replace the
+// actually better exit.
+func (b *board) incRef(incMean float64, now time.Time) float64 {
+	ref := incMean
+	if !b.incScoreAt.IsZero() && now.Sub(b.incScoreAt) < peakHold {
+		if p := b.incScore * peakRatio; p > ref {
+			ref = p
+		}
+	}
+	return ref
+}
+
 // switchTo reports a contender worth switching to: ≥2 samples, mean at
-// least switchRatio above the incumbent's, and the minimum gap since the
-// last switch respected.
+// least switchRatio above the incumbent reference, and the minimum gap
+// since the last switch respected.
 func (b *board) switchTo(now, lastSwitch time.Time) (string, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -2608,6 +2633,7 @@ func (b *board) switchTo(now, lastSwitch time.Time) (string, bool) {
 	if incN == 0 || incMean <= 0 {
 		return "", false
 	}
+	ref := b.incRef(incMean, now)
 	bestFP, bestM := "", 0.0
 	for fp, st := range b.stats {
 		if fp == b.inc || len(st.vals) < 2 {
@@ -2617,7 +2643,7 @@ func (b *board) switchTo(now, lastSwitch time.Time) (string, bool) {
 		for _, v := range st.vals {
 			sum += v
 		}
-		if m := sum / float64(len(st.vals)); m >= switchRatio*incMean &&
+		if m := sum / float64(len(st.vals)); m >= switchRatio*ref &&
 			m > bestM {
 			bestFP, bestM = fp, m
 		}
@@ -2626,11 +2652,12 @@ func (b *board) switchTo(now, lastSwitch time.Time) (string, bool) {
 }
 
 // seed initialises the board from a finished hunt: the winner becomes
-// the incumbent, every measured value is kept, then pruned.
-func (b *board) seed(inc string, results []exitScore, now time.Time) {
+// the incumbent (score = its winning mean), every measured value is
+// kept, then pruned.
+func (b *board) seed(inc string, score float64, results []exitScore, now time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.inc = inc
+	b.inc, b.incScore, b.incScoreAt = inc, score, now
 	for _, r := range results {
 		for _, v := range r.vals {
 			b.addLocked(r.fp, r.name, v, now)
@@ -2680,7 +2707,7 @@ func (s *server) startBoost() {
 	s.mu.Lock()
 	if s.board == nil || s.board.incumbent() != inc {
 		nb := newBoard()
-		nb.seed(inc, nil, time.Now())
+		nb.seed(inc, 0, nil, time.Now())
 		s.board = nb
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2811,7 +2838,7 @@ func (s *server) boostLoop(ctx context.Context, gen int) {
 			bd.cooldown(fp, time.Now())
 			continue
 		}
-		bd.setInc(fp)
+		bd.setInc(fp, cm, time.Now())
 		swAt := time.Now()
 		s.mu.Lock()
 		s.lastSwitch = swAt
