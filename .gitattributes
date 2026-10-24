@@ -1,0 +1,9 @@
+# Keep code LF-terminated so gofmt -l / make check pass on Windows
+# checkouts (core.autocrlf would otherwise flag every .go file).
+*.go    text eol=lf
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.html  text eol=lf
+*.md    text eol=lf
+*.png   binary
+*.exe   binary

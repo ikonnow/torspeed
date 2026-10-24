@@ -14,6 +14,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -308,6 +311,9 @@ func TestParseConsensus(t *testing.T) {
 	}
 	if !rs[0].exit || !rs[0].running || rs[0].bw != 50000 || rs[0].pol != "accept 80,443" {
 		t.Fatalf("relay 0 fields: %+v", rs[0])
+	}
+	if rs[0].ip != "1.2.3.4" || rs[1].ip != "5.6.7.8" {
+		t.Fatalf("OR address not parsed: %q %q", rs[0].ip, rs[1].ip)
 	}
 	if rs[1].exit || rs[1].pol != "" {
 		t.Fatalf("relay 1 fields: %+v", rs[1])
@@ -1591,5 +1597,366 @@ func TestFinishHuntAborted(t *testing.T) {
 		if strings.Contains(cmd, "SETCONF") || strings.Contains(cmd, "CLOSECIRCUIT") {
 			t.Fatalf("aborted hunt still touched the daemon: %v", cmds)
 		}
+	}
+}
+
+// ---------- candidate diversity ----------
+
+func TestSubnet24(t *testing.T) {
+	for in, want := range map[string]string{
+		"45.66.35.29":   "45.66.35",
+		"185.220.100.1": "185.220.100",
+		"":              "",
+		"1.2.3":         "", // malformed – never deduped
+		"2001:db8::1":   "", // not an IPv4 r-line address
+	} {
+		if got := subnet24(in); got != want {
+			t.Fatalf("subnet24(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The bandwidth-top pool concentrates operators in a few /24s (measured:
+// 22 of 60 relays inside 45.66.35.0/24). A plain slice probes the same
+// uplink several times; pickDiverse prefers unseen /24s and fills the
+// rest from the leftovers.
+func TestPickDiverse(t *testing.T) {
+	rl := func(ip string) relay { return relay{ip: ip} }
+	pool := []relay{
+		rl("45.66.35.10"), rl("45.66.35.11"), rl("45.66.35.12"),
+		rl("185.220.100.1"), rl("185.220.100.2"),
+		rl("9.9.9.9"), rl("8.8.8.8"), rl("7.7.7.7"),
+	}
+	want4 := []string{"45.66.35.10", "185.220.100.1", "9.9.9.9", "8.8.8.8"}
+	got := pickDiverse(pool, 4)
+	if len(got) != len(want4) {
+		t.Fatalf("len = %d, want %d", len(got), len(want4))
+	}
+	for i := range want4 {
+		if got[i].ip != want4[i] {
+			t.Fatalf("pick %d = %s, want %s (got %v)", i, got[i].ip, want4[i], got)
+		}
+	}
+	got = pickDiverse(pool, 6)
+	if len(got) != 6 || got[5].ip != "45.66.35.11" {
+		t.Fatalf("leftover fill wrong: %v", got)
+	}
+	// relays without a parseable IP are never deduplicated
+	if got := pickDiverse([]relay{rl(""), rl(""), rl("")}, 2); len(got) != 2 {
+		t.Fatalf("empty-IP relays deduped: %v", got)
+	}
+}
+
+// ---------- pin health ----------
+
+func TestIsFP(t *testing.T) {
+	for s, want := range map[string]bool{
+		fpHex(0xAA):                  true,
+		strings.ToLower(fpHex(0xAA)): true,
+		"{de}":                       false,
+		"DEADBEEF":                   false,
+		"":                           false,
+		fpHex(0xAA) + "00":           false,
+	} {
+		if isFP(s) != want {
+			t.Fatalf("isFP(%q) = %v, want %v", s, !want, want)
+		}
+	}
+}
+
+// pinCheck must release the pin only when the relay is provably unusable
+// (gone from the consensus, not Running, BadExit). Anything it cannot
+// judge – {de} pins, missing directory data, malformed replies – is left
+// alone: a transient gap must never drop a working pin.
+func TestPinCheck(t *testing.T) {
+	fp := fpHex(0x33)
+	ns := func(flags string) []string {
+		return []string{
+			"250+ns/id/" + fp + "=",
+			"r Some " + b64fp(0x33) + " dGVzdA 2025-01-01 12:00:00 1.2.3.4 443 0",
+			"s " + flags,
+			".",
+			"250 OK",
+		}
+	}
+	dirOK := []string{"250-status/enough-dir-info=1", "250 OK"}
+	ctrl := func(dir []string, nsr []string) (*ctrl, *[]string) {
+		var cmds []string
+		return fakeCtrl(t, func(cmd string) []string {
+			cmds = append(cmds, cmd)
+			switch cmd {
+			case "GETINFO status/enough-dir-info":
+				return dir
+			case "GETINFO ns/id/" + fp:
+				return nsr
+			}
+			return []string{"250 OK"}
+		}), &cmds
+	}
+
+	c, _ := ctrl(dirOK, ns("Exit Fast Running Stable Valid"))
+	if ok, why := pinCheck(c, fp); !ok {
+		t.Fatalf("healthy pin unusable: %s", why)
+	}
+
+	// tor answers 552 for relays missing from the consensus – readReply
+	// treats it as a completed reply, so the missing "r" line is the signal.
+	c, _ = ctrl(dirOK, []string{"552 Unrecognized key"})
+	if ok, why := pinCheck(c, fp); ok || why == "" {
+		t.Fatalf("dead pin kept: ok=%v why=%q", ok, why)
+	}
+
+	c, _ = ctrl(dirOK, ns("Exit BadExit Running Valid"))
+	if ok, why := pinCheck(c, fp); ok || why == "" {
+		t.Fatalf("BadExit pin kept: ok=%v why=%q", ok, why)
+	}
+
+	c, _ = ctrl(dirOK, ns("Exit Valid"))
+	if ok, why := pinCheck(c, fp); ok || why == "" {
+		t.Fatalf("not-Running pin kept: ok=%v why=%q", ok, why)
+	}
+
+	// tor still fetching directory data → don't judge, don't even ask.
+	c, cmds := ctrl([]string{"250-status/enough-dir-info=0", "250 OK"}, nil)
+	if ok, _ := pinCheck(c, fp); !ok {
+		t.Fatal("no dir info yet – pin dropped")
+	}
+	for _, cmd := range *cmds {
+		if strings.HasPrefix(cmd, "GETINFO ns/") {
+			t.Fatalf("queried ns/id without dir info: %v", *cmds)
+		}
+	}
+
+	// {de} / lists / whatever the user set themselves – never touched.
+	c, cmds = ctrl(dirOK, nil)
+	if ok, _ := pinCheck(c, "{de}"); !ok {
+		t.Fatal("country pin judged")
+	}
+	if len(*cmds) != 0 {
+		t.Fatalf("country pin triggered control commands: %v", *cmds)
+	}
+
+	// reply without flags → can't judge → keep.
+	c, _ = ctrl(dirOK, []string{
+		"250+ns/id/" + fp + "=",
+		"r Some " + b64fp(0x33) + " dGVzdA 2025-01-01 12:00:00 1.2.3.4 443 0",
+		".",
+		"250 OK",
+	})
+	if ok, _ := pinCheck(c, fp); !ok {
+		t.Fatal("flagless reply dropped the pin")
+	}
+}
+
+// fakeCtrlServer runs a scripted tor control port on a real loopback
+// listener (null auth) for code paths that dial via daemon.connect().
+// respond must be goroutine-safe.
+func fakeCtrlServer(t *testing.T, respond func(cmd string) []string) *daemon {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				r := bufio.NewReader(c)
+				for {
+					l, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					for _, out := range respond(strings.TrimRight(l, "\r\n")) {
+						if _, err := c.Write([]byte(out + "\r\n")); err != nil {
+							return
+						}
+					}
+				}
+			}(conn)
+		}
+	}()
+	return &daemon{addr: ln.Addr().String()}
+}
+
+// cmdLog records control commands (mutex-guarded).
+type cmdLog struct {
+	mu   sync.Mutex
+	cmds []string
+}
+
+func (l *cmdLog) add(cmd string) {
+	l.mu.Lock()
+	l.cmds = append(l.cmds, cmd)
+	l.mu.Unlock()
+}
+
+func (l *cmdLog) has(prefix string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, c := range l.cmds {
+		if strings.HasPrefix(c, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *cmdLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.cmds, " | ")
+}
+
+// huntScript answers what hunt() asks: a SOCKS listener, a two-exit
+// consensus, "250 OK" for everything else.
+func huntScript(log *cmdLog) func(string) []string {
+	return func(cmd string) []string {
+		log.add(cmd)
+		switch cmd {
+		case "GETINFO net/listeners/socks":
+			return []string{`250-net/listeners/socks="127.0.0.1:9"`, "250 OK"}
+		case "GETINFO ns/all":
+			return []string{"250+ns/all=",
+				"r ExitA " + b64fp(0xA1) + " dGVzdA 2025-01-01 12:00:00 1.1.1.1 443 0",
+				"s Exit Fast Running Valid", "w Bandwidth=9000", "p accept 80,443",
+				"r ExitB " + b64fp(0xB2) + " dGVzdA 2025-01-01 12:00:00 2.2.2.2 443 0",
+				"s Exit Fast Running Valid", "w Bandwidth=8000", "p accept 80,443",
+				".", "250 OK"}
+		}
+		return []string{"250 OK"}
+	}
+}
+
+// A hunt that finds no usable exit must leave the browsing pin alone when
+// it measured on the probe daemon – a probe-side outage must not drop the
+// user's working pin. In-place hunts pinned every candidate on the
+// browsing daemon, so there random selection has to be restored.
+func TestHuntNoUsableExitPin(t *testing.T) {
+	old := speedTestFn
+	defer func() { speedTestFn = old }()
+	speedTestFn = func(context.Context, probeOpts) (probeResult, error) {
+		return probeResult{}, io.ErrUnexpectedEOF // every sample fails
+	}
+	opts := func(probe *daemon) huntOpts {
+		return huntOpts{candidates: 2, samples: 1, maxMB: 1,
+			url: "http://127.0.0.1/f", probe: probe, logf: func(string) {}}
+	}
+
+	var bl, pl cmdLog
+	browse := fakeCtrlServer(t, huntScript(&bl))
+	probe := fakeCtrlServer(t, huntScript(&pl))
+	if best, _ := hunt(context.Background(), browse, opts(probe)); best.fp != "" {
+		t.Fatalf("best = %+v, want none", best)
+	}
+	if !pl.has("SETCONF ExitNodes=$") {
+		t.Fatalf("candidates never pinned on the probe: %s", &pl)
+	}
+	if bl.has("SETCONF ExitNodes") || bl.has("RESETCONF ExitNodes") {
+		t.Fatalf("probe hunt touched the browsing pin: %s", &bl)
+	}
+
+	var il cmdLog
+	inPlace := fakeCtrlServer(t, huntScript(&il))
+	hunt(context.Background(), inPlace, opts(nil))
+	if !il.has("RESETCONF ExitNodes") {
+		t.Fatalf("in-place hunt left the last candidate pinned: %s", &il)
+	}
+}
+
+// The watchdog action: a provably dead pin is released, only circuits
+// through that exit are closed, and boost (whose incumbent is gone)
+// stops. A healthy pin – or one a hunt/boost just replaced – stays.
+func TestReleaseDeadPin(t *testing.T) {
+	fp, other := fpHex(0xDD), fpHex(0xEE)
+	mid := "$" + fpHex(0x11) + "~mid"
+	script := func(log *cmdLog, nsReply []string, current string) func(string) []string {
+		return func(cmd string) []string {
+			log.add(cmd)
+			switch cmd {
+			case "GETINFO status/enough-dir-info":
+				return []string{"250-status/enough-dir-info=1", "250 OK"}
+			case "GETINFO ns/id/" + fp:
+				return nsReply
+			case "GETCONF ExitNodes":
+				return []string{"250-ExitNodes=$" + current, "250 OK"}
+			case "GETINFO circuit-status":
+				return []string{"250+circuit-status=",
+					"1 BUILT " + mid + ",$" + fp + "~dead PURPOSE=GENERAL",
+					"2 BUILT " + mid + ",$" + other + "~ok PURPOSE=GENERAL",
+					"3 BUILT " + mid + ",$" + fp + "~dead PURPOSE=CONFLUX_LINKED",
+					".", "250 OK"}
+			}
+			return []string{"250 OK"}
+		}
+	}
+	gone := []string{`552 Unrecognized key "ns/id/` + fp + `"`}
+
+	var l1 cmdLog
+	s := newTestServer()
+	cancelled := false
+	s.boosting, s.boostCancel = true, func() { cancelled = true }
+	if !s.releaseDeadPin(fakeCtrl(t, script(&l1, gone, fp)), fp) {
+		t.Fatalf("dead pin kept: %s", &l1)
+	}
+	for _, want := range []string{"RESETCONF ExitNodes", "CLOSECIRCUIT 1", "CLOSECIRCUIT 3"} {
+		if !l1.has(want) {
+			t.Fatalf("missing %q: %s", want, &l1)
+		}
+	}
+	if l1.has("CLOSECIRCUIT 2") {
+		t.Fatalf("closed a circuit on a healthy exit: %s", &l1)
+	}
+	if s.boosting || !cancelled {
+		t.Fatal("boost still running on a released incumbent")
+	}
+
+	// a hunt/boost re-pinned meanwhile → never clobber the new pin
+	var l2 cmdLog
+	if newTestServer().releaseDeadPin(fakeCtrl(t, script(&l2, gone, other)), fp) ||
+		l2.has("RESETCONF") {
+		t.Fatalf("replaced pin released: %s", &l2)
+	}
+
+	var l3 cmdLog
+	healthy := []string{"250+ns/id/" + fp + "=",
+		"r Ok " + b64fp(0xDD) + " dGVzdA 2025-01-01 12:00:00 1.2.3.4 443 0",
+		"s Exit Fast Running Valid", ".", "250 OK"}
+	s3 := newTestServer()
+	s3.boosting = true
+	if s3.releaseDeadPin(fakeCtrl(t, script(&l3, healthy, fp)), fp) ||
+		l3.has("RESETCONF") || l3.has("CLOSECIRCUIT") || !s3.boosting {
+		t.Fatalf("healthy pin released: %s", &l3)
+	}
+}
+
+// Brave's tor component on Windows has no .exe suffix
+// (…\User Data\<component-id>\<version>\tor-0.4.9.14-win32-brave-0) –
+// an *.exe glob left the probe daemon unspawnable.
+func TestTorBinaryBraveWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows component layout")
+	}
+	root := t.TempDir()
+	dir := filepath.Join(root, "BraveSoftware", "Brave-Browser", "User Data",
+		"cpoalefficncklhjfpglfiplenlpccdb", "1.0.50")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(dir, "tor-0.4.9.14-win32-brave-0")
+	for _, f := range []string{exe, filepath.Join(dir, "tor-torrc")} {
+		if err := os.WriteFile(f, nil, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", "")
+	t.Setenv("LOCALAPPDATA", root)
+	if got := torBinary(); got != exe {
+		t.Fatalf("torBinary() = %q, want %q", got, exe)
 	}
 }

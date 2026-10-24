@@ -31,7 +31,7 @@ $('dl').textContent=L.dm;$('bl').textContent=L.bl;VS.textContent=L.vs;
 MB.textContent=L.meas;
 let hunting=false,dkey='',noTor=false,lastS=null,progAt=0,
  live='–',huntBest={v:0,n:''},liveProbe={v:0,n:''},
- shownV=0,anim=0;
+ shownV=0,anim=0,lastGen=-1;
 // While a hunt runs, the big number behaves like a speedometer needle:
 // a faster probe pushes it up instantly, then it glides back down to
 // the true mean – the settled value is the one that gets pinned.
@@ -71,7 +71,10 @@ BC.onchange=()=>fetch(API+'/api/boost?on='+(BC.checked?1:0),{method:'POST'})
 // Browser routing lives in bg.js – the popup only sends messages.
 const msg=(o,cb)=>{try{chrome.runtime.sendMessage(o,r=>{
  if(!chrome.runtime.lastError&&r)cb(r);});}catch(e){}};
-const applyProxy=r=>{noTor=!!r.noTor;TC.checked=!!r.on;
+const applyProxy=r=>{
+ // ignore replies older than the newest intent change (stale sync races)
+ if(r.gen!=null){if(r.gen<lastGen)return;lastGen=r.gen;}
+ noTor=!!r.noTor;TC.checked=!!r.on;
  if(r.error)T.textContent=L.other;else renderStat();};
 TC.onchange=()=>msg({proxy:TC.checked},applyProxy);
 function renderStat(){

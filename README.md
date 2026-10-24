@@ -33,7 +33,9 @@ native host auto-starts `torspeed --serve` (API + dashboard on
 ### Find fastest exit
 
 `torspeed --hunt` or the **Find fastest exit** button: probes exit
-candidates, measures each on a fresh circuit, pins the winner
+candidates drawn at random from the top-60 exits — preferring **distinct
+/24 subnets**, since the bandwidth-top pool concentrates a few operators
+on shared uplinks — measures each on a fresh circuit, pins the winner
 (`SETCONF ExitNodes`) and closes the stale circuits so open tabs switch
 automatically — no reload needed. While `--serve` runs, measuring happens
 on a **dedicated probe tor daemon** (spawned automatically, per-user data
@@ -41,7 +43,11 @@ dir `~/.torspeed/probe`), so the per-candidate re-pinning never touches
 the browser's circuits — **your browsing is not interrupted** during a
 hunt. The winner is applied gracefully: the new exit's circuit is warmed
 up first, then old-exit circuits are swept — and a 10 s watcher keeps
-sweeping late stragglers while a pin is active. Takes a few minutes;
+sweeping late stragglers while a pin is active. Every 60 s it also
+health-checks the pin: `ExitNodes` is strict, so a pinned relay that left
+the consensus, lost `Running` or gained `BadExit` is **released**
+automatically instead of leaving the browser without exit circuits.
+Takes a few minutes;
 **Stop & keep best** ends it early with the best found so far. A
 `--target 15` value stops as soon as 15 Mbit/s is reached. Feeling slow
 again later? Exits are shared — that's what the boost below is for.

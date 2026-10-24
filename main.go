@@ -710,7 +710,8 @@ var speedTestFn = speedTest
 
 type relay struct {
 	fp, name      string
-	bw            int // KiB/s
+	ip            string // IPv4 OR address (r line, field 6)
+	bw            int    // KiB/s
 	exit, running bool
 	pol           string
 }
@@ -729,7 +730,11 @@ func parseConsensus(lines []string) []relay {
 			if err == nil {
 				fp = strings.ToUpper(hex.EncodeToString(raw))
 			}
-			rs = append(rs, relay{fp: fp, name: f[1]})
+			r := relay{fp: fp, name: f[1]}
+			if len(f) > 6 {
+				r.ip = f[6]
+			}
+			rs = append(rs, r)
 		case strings.HasPrefix(l, "s ") && len(rs) > 0:
 			fl := " " + l[2:] + " "
 			rs[len(rs)-1].exit = strings.Contains(fl, " Exit ") &&
@@ -819,6 +824,44 @@ func topExits(c *ctrl, n int) ([]relay, error) {
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+// subnet24 returns the /24 prefix of an IPv4 address – finer than tor's
+// own /16 path rule (EnforceDistinctSubnets), matching how today's exit
+// operators actually concentrate. Anything unparseable yields "", which
+// pickDiverse treats as its own group.
+func subnet24(ip string) string {
+	f := strings.Split(ip, ".")
+	if len(f) != 4 {
+		return ""
+	}
+	return f[0] + "." + f[1] + "." + f[2]
+}
+
+// pickDiverse draws up to n relays, preferring exits in distinct /24
+// subnets: the bandwidth-top pool concentrates a few operators on shared
+// uplinks (measured: 22 of the top-60 exits inside 45.66.35.0/24), so a
+// plain slice probes the same bottleneck repeatedly. Leftovers fill the
+// remaining slots, preserving the caller's (shuffled) order.
+func pickDiverse(pool []relay, n int) []relay {
+	seen := make(map[string]bool)
+	var first, rest []relay
+	for _, r := range pool {
+		sn := subnet24(r.ip)
+		if sn != "" && seen[sn] {
+			rest = append(rest, r)
+			continue
+		}
+		if sn != "" {
+			seen[sn] = true
+		}
+		first = append(first, r)
+	}
+	out := append(first, rest...)
+	if len(out) > n {
+		out = out[:n]
+	}
+	return out
 }
 
 // ---------- Pin / circuits ----------
@@ -961,6 +1004,85 @@ func relayInfo(c *ctrl, fp string) (name, ip string) {
 	return "", ""
 }
 
+// isFP reports whether s is a single 40-hex relay fingerprint – the only
+// ExitNodes form torspeed itself sets.
+func isFP(s string) bool {
+	_, err := hex.DecodeString(s)
+	return len(s) == 40 && err == nil
+}
+
+// pinCheck reports whether the pinned exit is still usable: in the
+// consensus, Running and not BadExit. ExitNodes is strict – a pinned
+// relay that dies leaves the browser without any exit circuits, so the
+// watchdog releases such pins. Anything not provably unusable returns
+// usable=true: {de}/list pins are never judged, and without directory
+// data (or on a malformed reply) a transient gap must not drop a
+// working pin.
+func pinCheck(c *ctrl, fp string) (usable bool, why string) {
+	if !isFP(fp) {
+		return true, ""
+	}
+	if lines, err := c.getinfo("status/enough-dir-info"); err != nil ||
+		len(lines) == 0 || strings.TrimSpace(lines[0]) != "1" {
+		return true, ""
+	}
+	lines, err := c.getinfo("ns/id/" + fp)
+	if err != nil {
+		return true, "" // control hiccup – don't judge
+	}
+	var rline, sline bool
+	var flags string
+	for _, l := range lines {
+		if strings.HasPrefix(l, "r ") {
+			rline = true
+		}
+		if strings.HasPrefix(l, "s ") {
+			sline = true
+			flags = " " + l[2:] + " "
+		}
+	}
+	// tor answers `552 Unrecognized key "ns/id/…"` for relays missing
+	// from the consensus; readReply completes it without an error (only
+	// transport failures error), so the missing r line is the signal.
+	if !rline {
+		return false, "gone from the consensus"
+	}
+	if !sline {
+		return true, "" // malformed – can't judge
+	}
+	if strings.Contains(flags, " BadExit ") {
+		return false, "flagged BadExit"
+	}
+	if !strings.Contains(flags, " Running ") {
+		return false, "not running"
+	}
+	return true, ""
+}
+
+// releaseDeadPin is the watchdog action: when pinCheck proves the pinned
+// exit unusable – and the pin is still fp, i.e. no hunt or boost switch
+// re-pinned meanwhile – it drops the pin, closes the circuits still
+// using that exit and stops boost (its incumbent is gone). Reports
+// whether the pin was released.
+func (s *server) releaseDeadPin(c *ctrl, fp string) bool {
+	ok, why := pinCheck(c, fp)
+	if ok || pinnedExit(c) != fp {
+		return false
+	}
+	name, _ := relayInfo(c, fp)
+	if name == "" {
+		name = fp[:12]
+	}
+	unpin(c)
+	n := closeWhere(c, func(ci circ) bool {
+		return ci.general() && strings.EqualFold(ci.exit(), fp)
+	})
+	s.stopBoost()
+	s.logf("pinned exit %s %s – pin released, %d circuits closed, random selection active",
+		name, why, n)
+	return true
+}
+
 // torBinary finds a tor executable: PATH, the usual install locations,
 // then Brave's bundled tor (versioned component dir – lexicographically
 // the newest match wins).
@@ -978,9 +1100,10 @@ func torBinary() string {
 	var pats []string
 	switch runtime.GOOS {
 	case "windows":
+		// Brave ships the component binary without an .exe suffix.
 		pats = []string{filepath.Join(os.Getenv("LOCALAPPDATA"),
 			"BraveSoftware", "Brave-Browser*", "User Data",
-			"*", "*", "tor-*-brave-*.exe")}
+			"*", "*", "tor-*-brave-*")}
 	case "darwin":
 		pats = []string{filepath.Join(home, "Library", "Application Support",
 			"BraveSoftware", "Brave-Browser*", "*", "*", "tor-*-brave-*")}
@@ -1566,11 +1689,8 @@ func hunt(ctx context.Context, d *daemon, o huntOpts) (best exitScore, results [
 		return
 	}
 	mrand.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
-	cands := pool
-	if len(cands) > o.candidates {
-		cands = cands[:o.candidates]
-	}
-	o.logf(fmt.Sprintf("%d candidates (random from top-%d)",
+	cands := pickDiverse(pool, o.candidates)
+	o.logf(fmt.Sprintf("%d candidates (distinct /24s preferred, random from top-%d)",
 		len(cands), len(pool)))
 	urls := testURLList(o.url)
 	// After the first successful sample only the known-good URL is used:
@@ -1660,8 +1780,14 @@ func hunt(ctx context.Context, d *daemon, o huntOpts) (best exitScore, results [
 		}
 	}
 	if best.fp == "" {
-		unpin(c)
-		o.logf("no usable exit – random selection active.")
+		// A probe hunt never touched the browsing pin – keep it.
+		// In-place hunts repinned per candidate → restore randomness.
+		if o.probe == nil {
+			unpin(c)
+			o.logf("no usable exit – random selection active.")
+		} else {
+			o.logf("no usable exit on the probe – previous pin kept.")
+		}
 		return
 	}
 	finishHunt(ctx, c, bsocks, best, known, urls, o)
@@ -3079,7 +3205,12 @@ func (s *server) run(port int) error {
 	// Pin enforcement: circuits can still appear on a stale exit a moment
 	// after a pin (late conflux legs) – sweep them, except while an
 	// in-place hunt is deliberately re-pinning the browsing daemon.
+	// Every pinHealthEvery ticks the pin itself is health-checked:
+	// ExitNodes is strict, so a pinned relay that died or left the
+	// consensus would leave the browser without any exit circuits.
+	const pinHealthEvery = 6 // 10 s tick → check every 60 s
 	go func() {
+		healthTick := 0
 		for range time.Tick(10 * time.Second) {
 			s.mu.Lock()
 			inPlace := s.hunting && !s.huntProbe
@@ -3099,6 +3230,11 @@ func (s *server) run(port int) error {
 				if n := sweepWrongExit(c, fp); n > 0 {
 					s.logf("closed %d circuits on stale exits", n)
 				}
+				if healthTick++; healthTick%pinHealthEvery == 0 {
+					s.releaseDeadPin(c, fp)
+				}
+			} else {
+				healthTick = 0
 			}
 			c.close()
 		}

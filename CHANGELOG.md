@@ -1,5 +1,27 @@
 # Changelog
 
+## unreleased
+
+- Hunt candidates are drawn preferring **distinct /24 subnets**: the
+  bandwidth-top-60 pool concentrates operators (measured: 22 relays in a
+  single /24), so a plain slice repeatedly probed the same uplink.
+- Pin watchdog: while a pin is active, `--serve` health-checks the exit
+  every 60 s. `ExitNodes` is strict, so a relay gone from the consensus,
+  no longer `Running` or flagged `BadExit` would leave the browser
+  without exit circuits – such pins are now released automatically, the
+  circuits still using that exit are closed and boost stops (its
+  incumbent is gone). Country/list pins, transient directory gaps and
+  pins a hunt/boost replaced meanwhile are never touched.
+- Windows: the probe daemon now finds Brave's bundled tor – the
+  component binary has no `.exe` suffix, so the old glob never matched
+  and every hunt fell back to measuring in place.
+- A hunt that finds no usable exit **keeps the previous pin** when it
+  measured on the probe daemon (the browsing pin was never disturbed);
+  in-place hunts still restore random selection.
+- Extension: proxy state changes are serialized in the background worker
+  and stale async replies are ignored in the popup (generation counter) –
+  fixes first-enable and toggle-on/off races.
+
 ## v0.6
 
 - Hunts measure on a dedicated probe tor daemon (`~/.torspeed/probe`,

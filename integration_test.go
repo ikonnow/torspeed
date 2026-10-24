@@ -94,3 +94,55 @@ func TestIntegrationHuntProbe(t *testing.T) {
 		}
 	}
 }
+
+// TestIntegrationWatchdog runs the pin watchdog against real tor replies:
+// a live top exit must stay pinned, a fingerprint missing from the
+// consensus must be released.
+//
+//	TORSPEED_IT_CTRL=127.0.0.1:19051 go test -tags integration \
+//		-run IntegrationWatchdog -v
+func TestIntegrationWatchdog(t *testing.T) {
+	addr := os.Getenv("TORSPEED_IT_CTRL")
+	if addr == "" {
+		t.Skip("TORSPEED_IT_CTRL not set")
+	}
+	d := probeDaemon(addr)
+	if d == nil {
+		t.Fatalf("no tor control port at %s", addr)
+	}
+	if !waitReady(d, 180*time.Second) {
+		t.Fatal("tor not ready")
+	}
+	c, err := d.connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.close()
+	defer unpin(c)
+	ex, err := topExits(c, 1)
+	if err != nil || len(ex) == 0 {
+		t.Fatalf("topExits: %v %v", ex, err)
+	}
+	s := &server{hub: &hub{clients: map[chan string]bool{}}}
+
+	pin(c, ex[0].fp)
+	if s.releaseDeadPin(c, ex[0].fp) {
+		t.Fatalf("healthy exit %s released", ex[0].name)
+	}
+	if p := pinnedExit(c); !strings.EqualFold(p, ex[0].fp) {
+		t.Fatalf("healthy pin changed: %q", p)
+	}
+
+	dead := strings.Repeat("A", 40) // in no consensus
+	pin(c, dead)
+	if p := pinnedExit(c); p != dead {
+		t.Fatalf("SETCONF of the dead fingerprint failed: %q", p)
+	}
+	if !s.releaseDeadPin(c, dead) {
+		t.Fatal("dead pin kept")
+	}
+	if p := pinnedExit(c); p != "" {
+		t.Fatalf("pin still set after release: %q", p)
+	}
+	t.Logf("kept live %s, released dead %s…", ex[0].name, dead[:8])
+}
