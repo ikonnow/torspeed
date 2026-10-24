@@ -8,7 +8,8 @@ const L=de?{cap:'Live-Traffic · Mbit/s',dir:'direkt',pin:'Gepinnt: ',
  nt:'Kein Tor-Daemon erreichbar – Seiten laden nicht',
  hunt:'Schnellsten Exit suchen',stop:'Stoppen & Besten behalten',
  unpin:'Exit-Pin lösen',cancel:'Abbrechen (Pin lösen)',meas:'Messen',
- other:'Eine andere Erweiterung steuert den Proxy',err:'Fehler',eip:'Exit-IP '}:
+ other:'Eine andere Erweiterung steuert den Proxy',err:'Fehler',eip:'Exit-IP ',
+ bl:'Im Hintergrund weiter optimieren'}:
 {cap:'live traffic · Mbit/s',dir:'direct',pin:'Pinned: ',
  fast:'fastest so far · Mbit/s — ',search:'searching…',live:'live traffic ',
  rand:'Random exit (not pinned)',run:'Hunting…',
@@ -18,14 +19,17 @@ const L=de?{cap:'Live-Traffic · Mbit/s',dir:'direkt',pin:'Gepinnt: ',
  nt:"No Tor daemon reachable – pages won't load",
  hunt:'Find fastest exit',stop:'Stop & keep best',
  unpin:'Unpin exit',cancel:'Cancel (unpin)',meas:'Measure',
- other:'Another extension controls the proxy',err:'Error',eip:'exit IP '};
+ other:'Another extension controls the proxy',err:'Error',eip:'exit IP ',
+ bl:'Keep improving in background'};
 const $=i=>document.getElementById(i);
 const SV=$('sv'),S=$('s'),LV=$('lv'),R=$('r'),T=$('st'),LG=$('lg'),H=$('h'),
- Q=$('p'),TC=$('tc'),VC=$('vc'),NB=$('n'),MB=$('m'),DS=$('ds'),VS=$('vs');
+ Q=$('p'),TC=$('tc'),VC=$('vc'),BC=$('bc'),NB=$('n'),MB=$('m'),DS=$('ds'),
+ VS=$('vs');
 const API='http://127.0.0.1:8765';
 $('cap').textContent=L.cap;$('tl').textContent=L.bt;$('vl').textContent=L.vp;
-$('dl').textContent=L.dm;VS.textContent=L.vs;MB.textContent=L.meas;
-let hunting=false,dkey='',noTor=false,lastS=null,
+$('dl').textContent=L.dm;$('bl').textContent=L.bl;VS.textContent=L.vs;
+MB.textContent=L.meas;
+let hunting=false,dkey='',noTor=false,lastS=null,progAt=0,
  live='–',huntBest={v:0,n:''},liveProbe={v:0,n:''},
  shownV=0,anim=0;
 // While a hunt runs, the big number behaves like a speedometer needle:
@@ -61,6 +65,9 @@ VS.onclick=()=>post('compare');
 VC.onchange=()=>fetch(API+'/api/proxy?on='+(VC.checked?1:0),{method:'POST'})
  .then(r=>r.json()).then(d=>{VC.checked=d.proxy})
  .catch(()=>{T.textContent=L.err;VC.checked=!VC.checked});
+BC.onchange=()=>fetch(API+'/api/boost?on='+(BC.checked?1:0),{method:'POST'})
+ .then(r=>r.json()).then(d=>{BC.checked=d.boost_auto})
+ .catch(()=>{T.textContent=L.err;BC.checked=!BC.checked});
 // Browser routing lives in bg.js – the popup only sends messages.
 const msg=(o,cb)=>{try{chrome.runtime.sendMessage(o,r=>{
  if(!chrome.runtime.lastError&&r)cb(r);});}catch(e){}};
@@ -93,7 +100,14 @@ function poll(){fetch(API+'/api/status').then(r=>r.json()).then(s=>{
    o.value=x.addr;o.textContent=x.name+(x.ready?'':L.nr);DS.appendChild(o)});}
  dl.forEach(x=>{if(s.daemon&&s.daemon.indexOf(x.addr)>=0)DS.value=x.addr});
  VC.checked=!!s.proxy;
+ BC.checked=!!s.boost_auto;
  hunting=!!s.hunting;
+ // boost status in #p, but never over an active probe line
+ if(Date.now()-progAt>2000)
+  Q.textContent=(s.boost&&!hunting)?
+   'Boost: '+(s.boost_probes||0)+(de?' Tests':' probes')+' · '+
+   (s.boost_switches||0)+' '+
+   (de?'Wechsel':((s.boost_switches||0)==1?'switch':'switches')):'';
  huntBest={v:s.hunt_best_mbps||0,n:s.hunt_best_name||''};
  if(!hunting)liveProbe={v:0,n:''};
  renderBig();
@@ -116,7 +130,7 @@ es.onmessage=e=>{const d=JSON.parse(e.data);
   live=(bws.reduce((a,b)=>a+b,0)/bws.length*8/1e6).toFixed(1);renderBig();}
  if(d.type=='best'){huntBest={v:d.v,n:d.name};push();
   msg({badge:d.v});}
- if(d.type=='prog'){liveProbe={v:d.v,n:d.name};
+ if(d.type=='prog'){liveProbe={v:d.v,n:d.name};progAt=Date.now();
   Q.textContent=L.probe+(d.name?d.name+': ':'')+d.v.toFixed(1)+' Mbit/s';
   push();if(d.v>huntBest.v)msg({badge:d.v});}
  if(d.type=='mbps'){Q.textContent='';poll();msg({badge:d.v});}

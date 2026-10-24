@@ -30,6 +30,7 @@ import (
 	mrand "math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -702,6 +703,9 @@ func speedTest(ctx context.Context, o probeOpts) (probeResult, error) {
 	return res, nil
 }
 
+// speedTestFn is a variable so tests can stub out the real download.
+var speedTestFn = speedTest
+
 // ---------- Consensus / candidates ----------
 
 type relay struct {
@@ -830,51 +834,99 @@ func unpin(c *ctrl) {
 	c.cmd("RESETCONF ExitNodes")
 }
 
-// exitFP returns the exit relay fingerprint of a BUILT general-purpose
-// circuit-status line, or "" for anything else (HS circuits, still
-// extending, malformed).
-func exitFP(l string) string {
-	f := strings.Fields(l)
-	if len(f) < 3 || f[1] != "BUILT" {
-		return ""
-	}
-	purpose := ""
-	for _, kv := range f[3:] {
-		if p, ok := strings.CutPrefix(kv, "PURPOSE="); ok {
-			purpose = p
-			break
-		}
-	}
-	if purpose != "GENERAL" && purpose != "CONFLUX_LINKED" {
-		return ""
-	}
-	path := strings.Split(f[2], ",")
-	last := strings.TrimPrefix(path[len(path)-1], "$")
-	if i := strings.Index(last, "~"); i >= 0 {
-		last = last[:i]
-	}
-	return last
+// circ is one parsed circuit-status line: id, status (BUILT/EXTENDED…),
+// path = hop fingerprints ($ and ~name stripped, uppercase), plus the
+// PURPOSE= and SOCKS_USERNAME fields (isolated circuits carry the SOCKS
+// username their stream used).
+type circ struct {
+	id, status, purpose, user string
+	path                      []string
 }
 
-// closeStaleCircuits kills BUILT general-purpose circuits whose LAST hop
-// is not keepFP. ExitNodes/NEWNYM only affect NEW streams – keep-alive
-// and HTTP/2 connections would linger on the old exit otherwise, so a
-// freshly pinned exit would not take effect in open tabs. Hidden-service
-// and still-extending circuits are never touched.
-func closeStaleCircuits(c *ctrl, keepFP string) int {
+func parseCirc(l string) (circ, bool) {
+	f := strings.Fields(l)
+	if len(f) < 3 || !isDigits(f[0]) {
+		return circ{}, false
+	}
+	ci := circ{id: f[0], status: f[1]}
+	for _, h := range strings.Split(f[2], ",") {
+		h = strings.TrimPrefix(h, "$")
+		if i := strings.IndexAny(h, "~="); i >= 0 {
+			h = h[:i]
+		}
+		ci.path = append(ci.path, strings.ToUpper(h))
+	}
+	for _, kv := range f[3:] {
+		if v, ok := strings.CutPrefix(kv, "PURPOSE="); ok {
+			ci.purpose = v
+		}
+		if v, ok := strings.CutPrefix(kv, "SOCKS_USERNAME="); ok {
+			ci.user = strings.Trim(v, `"`)
+		}
+	}
+	return ci, true
+}
+
+// exit returns the last hop fingerprint – the exit for BUILT circuits.
+func (c circ) exit() string {
+	if len(c.path) == 0 {
+		return ""
+	}
+	return c.path[len(c.path)-1]
+}
+
+// general reports whether the circuit is a BUILT stream circuit tor may
+// hand to client traffic: PURPOSE=GENERAL or a conflux set.
+func (c circ) general() bool {
+	if c.status != "BUILT" {
+		return false
+	}
+	switch c.purpose {
+	case "GENERAL", "CONFLUX_LINKED", "CONFLUX_UNLINKED":
+		return true
+	}
+	return false
+}
+
+// exitFP returns the exit relay fingerprint of a BUILT general-purpose
+// circuit-status line (GENERAL or a conflux set), or "" for anything
+// else (HS circuits, still extending, malformed).
+func exitFP(l string) string {
+	ci, ok := parseCirc(l)
+	if !ok || !ci.general() {
+		return ""
+	}
+	return ci.exit()
+}
+
+// closeWhere kills every circuit matching pred; returns the count.
+func closeWhere(c *ctrl, pred func(circ) bool) int {
 	lines, _ := c.getinfo("circuit-status")
 	n := 0
 	for _, l := range lines {
-		fp := exitFP(l)
-		if fp == "" || strings.EqualFold(fp, keepFP) {
+		ci, ok := parseCirc(l)
+		if !ok || !pred(ci) {
 			continue
 		}
-		if r, err := c.cmd("CLOSECIRCUIT " + strings.Fields(l)[0]); err == nil &&
+		if r, err := c.cmd("CLOSECIRCUIT " + ci.id); err == nil &&
 			len(r) > 0 && strings.HasPrefix(r[len(r)-1], "250") {
 			n++
 		}
 	}
 	return n
+}
+
+// sweepWrongExit kills BUILT general-purpose circuits whose LAST hop
+// is not keepFP. ExitNodes only affects NEW streams – keep-alive
+// and HTTP/2 connections would linger on the old exit otherwise, so a
+// freshly pinned exit would not take effect in open tabs. Conflux legs
+// tor builds a moment after the SETCONF can also still carry the old
+// exit. Hidden-service and still-extending circuits are never touched.
+func sweepWrongExit(c *ctrl, keepFP string) int {
+	return closeWhere(c, func(ci circ) bool {
+		return ci.general() && ci.exit() != "" &&
+			!strings.EqualFold(ci.exit(), keepFP)
+	})
 }
 
 // lastCircuitExit returns the exit fingerprint of the newest BUILT
@@ -909,20 +961,49 @@ func relayInfo(c *ctrl, fp string) (name, ip string) {
 	return "", ""
 }
 
+// torBinary finds a tor executable: PATH, the usual install locations,
+// then Brave's bundled tor (versioned component dir – lexicographically
+// the newest match wins).
+func torBinary() string {
+	if p, err := exec.LookPath("tor"); err == nil {
+		return p
+	}
+	for _, p := range []string{"/opt/homebrew/bin/tor",
+		"/usr/local/bin/tor", "/usr/bin/tor"} {
+		if fileExists(p) {
+			return p
+		}
+	}
+	home, _ := os.UserHomeDir()
+	var pats []string
+	switch runtime.GOOS {
+	case "windows":
+		pats = []string{filepath.Join(os.Getenv("LOCALAPPDATA"),
+			"BraveSoftware", "Brave-Browser*", "User Data",
+			"*", "*", "tor-*-brave-*.exe")}
+	case "darwin":
+		pats = []string{filepath.Join(home, "Library", "Application Support",
+			"BraveSoftware", "Brave-Browser*", "*", "*", "tor-*-brave-*")}
+	default:
+		pats = []string{filepath.Join(home, ".config", "BraveSoftware",
+			"Brave-Browser*", "*", "*", "tor-*-brave-*")}
+	}
+	var matches []string
+	for _, pat := range pats {
+		matches = append(matches, filepathGlob(pat)...)
+	}
+	if len(matches) == 0 {
+		return ""
+	}
+	sort.Strings(matches)
+	return matches[len(matches)-1]
+}
+
 // spawnTor launches a dedicated Tor daemon (SOCKS 9050, control 9051,
 // cookie auth). The browser can then surf via proxy settings directly
 // over Tor – no Tor Browser window needed.
 func spawnTor() error {
-	exe, err := exec.LookPath("tor")
-	if err != nil {
-		for _, p := range []string{"/opt/homebrew/bin/tor",
-			"/usr/local/bin/tor", "/usr/bin/tor"} {
-			if _, e := os.Stat(p); e == nil {
-				exe = p
-				break
-			}
-		}
-	}
+	exe := torBinary()
 	if exe == "" {
 		return errors.New("tor binary not found – install first: brew install tor")
 	}
@@ -942,6 +1023,90 @@ func spawnTor() error {
 		return fmt.Errorf("tor start: %v (%s)", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// spawnProbeTor launches the dedicated measuring tor: auto SOCKS/control
+// ports (announced via ControlPortWriteToFile), cookie auth, owned by
+// this process so it dies with us. A stale controlport file is removed
+// first; if the new tor exits immediately (data dir locked by an older
+// instance that is still running) that instance's address is used.
+func spawnProbeTor(dir string) (*daemon, *exec.Cmd, error) {
+	exe := torBinary()
+	if exe == "" {
+		return nil, nil, errors.New(
+			"tor binary not found – install first: brew install tor")
+	}
+	os.MkdirAll(dir, 0700)
+	cpFile := filepath.Join(dir, "controlport")
+	old, _ := os.ReadFile(cpFile)
+	os.Remove(cpFile)
+	cmd := exec.Command(exe,
+		"--SocksPort", "auto",
+		"--ControlPort", "auto",
+		"--ControlPortWriteToFile", cpFile,
+		"--CookieAuthentication", "1",
+		"--DataDirectory", dir,
+		"--__OwningControllerProcess", strconv.Itoa(os.Getpid()),
+		"--Log", "notice file "+filepath.Join(dir, "tor.log"))
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("probe tor start: %w", err)
+	}
+	go cmd.Wait()
+	addrOf := func(b []byte) string {
+		s := string(b)
+		i := strings.Index(s, "PORT=127.0.0.1:")
+		if i < 0 {
+			return ""
+		}
+		s = s[i+5:]
+		if j := strings.IndexByte(s, '\n'); j >= 0 {
+			s = s[:j]
+		}
+		return strings.TrimSpace(s)
+	}
+	probe := func(b []byte) *daemon {
+		if d := probeDaemon(addrOf(b)); d != nil {
+			d.name = "probe-tor"
+			return d
+		}
+		return nil
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(cpFile); err == nil {
+			if d := probe(b); d != nil {
+				return d, cmd, nil
+			}
+		}
+		if cmd.ProcessState != nil {
+			break // died instantly – locked data dir?
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if b, err := os.ReadFile(cpFile); err == nil {
+		old = b
+	}
+	if d := probe(old); d != nil {
+		return d, cmd, nil // older instance still running – reuse it
+	}
+	return nil, cmd, errors.New("probe tor: no control port within 30 s")
+}
+
+// waitReady polls status/circuit-established until the daemon reports 1.
+func waitReady(d *daemon, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if c, err := d.connect(); err == nil {
+			lines, gerr := c.getinfo("status/circuit-established")
+			c.close()
+			if gerr == nil && len(lines) > 0 &&
+				strings.TrimSpace(lines[0]) == "1" {
+				return true
+			}
+		}
+		time.Sleep(time.Second)
+	}
+	return false
 }
 
 // ---------- System proxy (SOCKS) ----------
@@ -1162,35 +1327,234 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 	}
 }
 
-// hunt tests top exits and pins the best. logf receives every line (UI/SSE).
-func hunt(ctx context.Context, d *daemon, target float64, candidates int,
-	url string, maxMB int64, samples int,
-	logf func(string), prog func(string, float64),
-	onBest func(string, float64)) (bestFP, bestName string, bestMbps float64) {
+// ---------- Measure (shared by hunt + boost) ----------
 
+// errWrongExit marks a sample whose isolated circuits did not exit via
+// the pinned candidate – tor may attach a stream to a stale conflux set
+// built for the previous candidate right after a SETCONF.
+var errWrongExit = errors.New("sample on wrong exit")
+
+// prepareExit pins the MEASURING daemon to fp and drops circuits that
+// still show a different exit.
+func prepareExit(c *ctrl, fp string) {
+	pin(c, fp)
+	sweepWrongExit(c, fp)
+}
+
+// isolatedSample runs one speed test under a fresh isolation token
+// (dedicated circuit, random middle). Afterwards it verifies that every
+// circuit carrying the token really exited via fp – a stale conflux set
+// can otherwise put the sample on the previous candidate's exit. The
+// token's circuits are always closed again; other users' circuits are
+// never touched.
+func isolatedSample(ctx context.Context, c *ctrl, socks, fp string,
+	urls []string, maxMB int64, maxDur time.Duration, label string,
+	prog func(string, float64), abortBelow float64) (probeResult, error) {
+
+	token := isolationToken()
+	sctx, scancel := context.WithCancel(ctx)
+	defer scancel()
+	var ticks, stable int
+	var prev float64
+	res, err := speedTestFn(sctx, probeOpts{
+		socks:   socks,
+		isolate: token, // fresh circuit, new random middle
+		urls:    urls,
+		maxMB:   maxMB,
+		maxDur:  maxDur,
+		streams: 3,
+		label:   label,
+		prog: func(name string, v float64) {
+			if prog != nil {
+				prog(name, v)
+			}
+			ticks++
+			if ticks < 3 {
+				return // need ≥2 s of windowed data first
+			}
+			// clearly worse than the best value → abort the probe
+			if abortBelow > 0 && v < abortBelow {
+				scancel()
+				return
+			}
+			// rate converged → end the download early
+			if prev > 0 && math.Abs(v-prev)/v < 0.05 {
+				if stable++; stable >= 2 {
+					scancel()
+				}
+			} else {
+				stable = 0
+			}
+			prev = v
+		}})
+	wrong := false
+	closeWhere(c, func(ci circ) bool {
+		if ci.user != token {
+			return false
+		}
+		if !strings.EqualFold(ci.exit(), fp) {
+			wrong = true
+		}
+		return true
+	})
+	if err != nil {
+		return res, err
+	}
+	if wrong {
+		return res, errWrongExit
+	}
+	return res, nil
+}
+
+// warmDest returns host:port of a test URL for the warm-up connect that
+// builds the browser-class circuit on a freshly pinned exit.
+func warmDest(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
+		port := u.Port()
+		if port == "" {
+			if u.Scheme == "http" {
+				port = "80"
+			} else {
+				port = "443"
+			}
+		}
+		return net.JoinHostPort(u.Hostname(), port)
+	}
+	return "fsn1-speed.hetzner.com:443"
+}
+
+// applyExit switches the BROWSING daemon to exit fp: pin, then warm the
+// new exit with a no-auth connect – the same isolation class as the
+// browser's PAC traffic – so a fresh circuit is up before the stale ones
+// are swept. One warm retry; on failure the previous pin is restored and
+// nothing is closed.
+func applyExit(ctx context.Context, c *ctrl, socks, fp, warmHost string) (int, error) {
+	if warmHost == "" {
+		warmHost = "fsn1-speed.hetzner.com:443"
+	}
+	prev := pinnedExit(c)
+	pin(c, fp)
+	warm := func() bool {
+		wctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		conn, err := dialSocks(wctx, socks, "", warmHost)
+		if err == nil {
+			conn.Close()
+		}
+		return err == nil
+	}
+	if !warm() && !warm() {
+		if prev == "" {
+			unpin(c)
+		} else {
+			pin(c, prev)
+		}
+		return 0, fmt.Errorf("warm-up via %s failed", warmHost)
+	}
+	return sweepWrongExit(c, fp), nil
+}
+
+// browserProbe measures on the BROWSING daemon with no isolation token –
+// the same isolation class as the browser's PAC traffic, so the number
+// reflects the circuit the browser actually gets. A result far below
+// expect means the stream landed on a bad circuit: close the no-auth
+// circuits on fp, warm again, re-measure (max 2 re-rolls).
+func browserProbe(ctx context.Context, c *ctrl, socks, fp string,
+	expect float64, urls []string, maxMB int64,
+	prog func(string, float64), logf func(string)) (float64, error) {
+
+	for attempt := 0; ; attempt++ {
+		res, err := speedTestFn(ctx, probeOpts{
+			socks:   socks,
+			urls:    urls,
+			maxMB:   maxMB,
+			streams: 3,
+			prog:    prog})
+		if err != nil || fp == "" || expect <= 0 ||
+			res.mbps >= 0.6*expect || attempt >= 2 {
+			return res.mbps, err
+		}
+		if logf != nil {
+			logf(fmt.Sprintf("circuit at %.1f Mbit/s (%.1f expected) – re-rolling",
+				res.mbps, expect))
+		}
+		closeWhere(c, func(ci circ) bool {
+			return ci.general() && ci.user == "" &&
+				strings.EqualFold(ci.exit(), fp)
+		})
+		wctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		if conn, err := dialSocks(wctx, socks, "", warmDest("")); err == nil {
+			conn.Close()
+		}
+		cancel()
+	}
+}
+
+// ---------- Hunt ----------
+
+// exitScore is a candidate's hunt result: the samples and their mean –
+// the browser will use random middles later, so the average is what
+// counts, not a lucky middle.
+type exitScore struct {
+	fp, name string
+	vals     []float64
+	mean     float64
+}
+
+type huntOpts struct {
+	target     float64
+	candidates int
+	url        string
+	maxMB      int64
+	samples    int
+	probe      *daemon // dedicated measuring daemon; nil = measure on d
+	logf       func(string)
+	prog       func(string, float64)
+	onBest     func(string, float64)
+	aborted    func() bool // non-nil → checked at finalization (skip pin)
+}
+
+// hunt tests top exits and pins the best on d. With o.probe set the
+// measuring runs on that dedicated daemon – per-candidate ExitNodes pins
+// then never touch the browser's circuits. logf gets every line (UI/SSE).
+func hunt(ctx context.Context, d *daemon, o huntOpts) (best exitScore, results []exitScore) {
 	c, err := d.connect()
 	if err != nil {
-		logf("control connection: " + err.Error())
+		o.logf("control connection: " + err.Error())
 		return
 	}
 	defer c.close()
-	socks, err := socksAddr(c)
+	bsocks, _ := socksAddr(c)
+	md := d
+	if o.probe != nil {
+		md = o.probe
+		o.logf("measuring on probe daemon – browsing is not interrupted")
+	}
+	mc := c
+	if md != d {
+		if mc, err = md.connect(); err != nil {
+			o.logf("probe daemon: " + err.Error())
+			return
+		}
+		defer mc.close()
+	}
+	socks, err := socksAddr(mc)
 	if err != nil {
-		logf("SOCKS: " + err.Error())
+		o.logf("SOCKS: " + err.Error())
 		return
 	}
-	logf("Loading consensus …")
+	o.logf("Loading consensus …")
 	// Pool instead of a fixed top-N: consensus bandwidth does not correlate
 	// with congestion – the fastest exits are the most contested ones.
 	// `candidates` candidates are drawn randomly from the top 60.
 	var pool []relay
 	for a := 0; a < 6; a++ {
-		pool, err = topExits(c, 60)
+		pool, err = topExits(mc, 60)
 		if err == nil && len(pool) > 0 {
 			break
 		}
 		if a < 5 {
-			logf("tor still starting – waiting for consensus …")
+			o.logf("tor still starting – waiting for consensus …")
 			sleepCtx(ctx, 5*time.Second)
 			if ctx.Err() != nil {
 				break
@@ -1198,29 +1562,29 @@ func hunt(ctx context.Context, d *daemon, target float64, candidates int,
 		}
 	}
 	if err != nil || len(pool) == 0 {
-		logf("no exits in consensus – tor still starting?")
+		o.logf("no exits in consensus – tor still starting?")
 		return
 	}
 	mrand.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
 	cands := pool
-	if len(cands) > candidates {
-		cands = cands[:candidates]
+	if len(cands) > o.candidates {
+		cands = cands[:o.candidates]
 	}
-	logf(fmt.Sprintf("%d candidates (random from top-%d)",
+	o.logf(fmt.Sprintf("%d candidates (random from top-%d)",
 		len(cands), len(pool)))
-	urls := testURLList(url)
+	urls := testURLList(o.url)
 	// After the first successful sample only the known-good URL is used:
 	// a candidate that cannot reach it is the exit's fault, not the test
 	// host's. Two consecutive such failures → the host may rate-limit,
 	// fall back to the full list.
 	known := ""
 	knownFails := 0
-	bestMbps = -1
+	best.mean = -1
 	for i, r := range cands {
 		if ctx.Err() != nil {
 			break
 		}
-		pin(c, r.fp)
+		prepareExit(mc, r.fp)
 		head := fmt.Sprintf("[%d/%d] %-20s weight %6d ",
 			i+1, len(cands), r.name, r.bw)
 		sampleURLs := urls
@@ -1229,41 +1593,18 @@ func hunt(ctx context.Context, d *daemon, target float64, candidates int,
 		}
 		var vals []float64
 		var lastErr error
-		for j := 0; j < samples && ctx.Err() == nil; j++ {
-			sctx, scancel := context.WithCancel(ctx)
-			var ticks, stable int
-			var prev float64
-			res, err := speedTest(sctx, probeOpts{
-				socks:   socks,
-				isolate: isolationToken(), // fresh circuit, new random middle
-				urls:    sampleURLs,
-				maxMB:   maxMB,
-				streams: 3,
-				label:   r.name,
-				prog: func(name string, v float64) {
-					if prog != nil {
-						prog(name, v)
-					}
-					ticks++
-					if ticks < 3 {
-						return // need ≥2 s of windowed data first
-					}
-					// clearly worse than the best value → abort the probe
-					if bestMbps > 0 && v < bestMbps*0.7 {
-						scancel()
-						return
-					}
-					// rate converged → end the download early
-					if prev > 0 && math.Abs(v-prev)/v < 0.05 {
-						if stable++; stable >= 2 {
-							scancel()
-						}
-					} else {
-						stable = 0
-					}
-					prev = v
-				}})
-			scancel()
+		for j := 0; j < o.samples && ctx.Err() == nil; j++ {
+			abortBelow := 0.0
+			if best.mean > 0 {
+				abortBelow = best.mean * 0.7
+			}
+			res, err := isolatedSample(ctx, mc, socks, r.fp, sampleURLs,
+				o.maxMB, 0, r.name, o.prog, abortBelow)
+			if errors.Is(err, errWrongExit) {
+				o.logf(head + "sample on a stale exit – retrying once")
+				res, err = isolatedSample(ctx, mc, socks, r.fp, sampleURLs,
+					o.maxMB, 0, r.name, o.prog, abortBelow)
+			}
 			if err != nil {
 				lastErr = err
 				if j == 0 {
@@ -1279,11 +1620,11 @@ func hunt(ctx context.Context, d *daemon, target float64, candidates int,
 		}
 		if len(vals) == 0 {
 			if ctx.Err() == nil {
-				logf(head + fmt.Sprintf("failed (%s)", lastErr))
+				o.logf(head + fmt.Sprintf("failed (%s)", lastErr))
 				if known != "" {
 					if knownFails++; knownFails >= 2 {
 						known, knownFails = "", 0
-						logf("known test URL failing – back to the full list")
+						o.logf("known test URL failing – back to the full list")
 					}
 				}
 				continue
@@ -1302,49 +1643,73 @@ func hunt(ctx context.Context, d *daemon, target float64, candidates int,
 		for j, v := range vals {
 			indiv[j] = fmt.Sprintf("%.1f", v)
 		}
+		sc := exitScore{fp: r.fp, name: r.name, vals: vals, mean: mbps}
+		results = append(results, sc)
 		tag := ""
-		if mbps > bestMbps {
-			bestMbps, bestFP, bestName = mbps, r.fp, r.name
+		if mbps > best.mean {
+			best = sc
 			tag = "  <-- BEST"
-			if onBest != nil {
-				onBest(r.name, mbps)
+			if o.onBest != nil {
+				o.onBest(r.name, mbps)
 			}
 		}
-		logf(head + fmt.Sprintf("%s %5.1f Mbit/s (%s)%s",
-			bar(mbps, target, 12), mbps, strings.Join(indiv, "/"), tag))
-		if ctx.Err() != nil || (target > 0 && mbps >= target) {
+		o.logf(head + fmt.Sprintf("%s %5.1f Mbit/s (%s)%s",
+			bar(mbps, o.target, 12), mbps, strings.Join(indiv, "/"), tag))
+		if ctx.Err() != nil || (o.target > 0 && mbps >= o.target) {
 			break
 		}
 	}
-	if bestFP != "" {
-		pin(c, bestFP)
-		// Open connections keep the old exit otherwise – kill their
-		// circuits so tabs switch to the pinned exit without a reload.
-		closed := closeStaleCircuits(c, bestFP)
-		c.cmd("SIGNAL NEWNYM")
-		sleepCtx(ctx, 4*time.Second)
-		verify := ""
-		vurls := urls
-		if known != "" {
-			vurls = []string{known}
-		}
-		if res, err := speedTest(ctx, probeOpts{
-			socks:   socks,
-			isolate: isolationToken(),
-			urls:    vurls,
-			maxMB:   maxMB,
-			streams: 3,
-			label:   bestName,
-			prog:    prog}); err == nil {
-			verify = fmt.Sprintf(", verification: %.1f", res.mbps)
-		}
-		logf(fmt.Sprintf("BEST EXIT PINNED: %s (best %.1f%s Mbit/s) – %d old circuits closed, tabs switch automatically",
-			bestName, bestMbps, verify, closed))
-	} else {
+	if best.fp == "" {
 		unpin(c)
-		logf("no usable exit – random selection active.")
+		o.logf("no usable exit – random selection active.")
+		return
 	}
+	finishHunt(ctx, c, bsocks, best, known, urls, o)
 	return
+}
+
+// sweepDelay is the pause between the post-pin sweeps – a var so tests
+// can shrink it.
+var sweepDelay = 5 * time.Second
+
+// finishHunt pins best on the browsing daemon and verifies the result.
+// It detaches from the caller's context: "stop & keep best" cancels the
+// hunt, and the cancelled ctx would otherwise make applyExit's warm-up
+// fail instantly and restore the previous pin. A fresh 90 s context
+// covers the warm dial, the delayed sweeps and the verification probe.
+func finishHunt(ctx context.Context, c *ctrl, bsocks string,
+	best exitScore, known string, urls []string, o huntOpts) {
+	if o.aborted != nil && o.aborted() {
+		o.logf("aborted – nothing pinned")
+		return
+	}
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx),
+		90*time.Second)
+	defer cancel()
+	closed, aerr := applyExit(fctx, c, bsocks, best.fp, warmDest(known))
+	if aerr != nil {
+		o.logf(fmt.Sprintf("pinning %s failed: %s – previous pin kept",
+			best.name, aerr))
+		return
+	}
+	// Conflux legs with an old exit can still appear a moment after the
+	// SETCONF – sweep twice more so no stream stays behind.
+	for k := 0; k < 2; k++ {
+		sleepCtx(fctx, sweepDelay)
+		closed += sweepWrongExit(c, best.fp)
+	}
+	vurls := urls
+	if known != "" {
+		vurls = []string{known}
+	}
+	meas, _ := browserProbe(fctx, c, bsocks, best.fp, best.mean, vurls,
+		o.maxMB, o.prog, o.logf)
+	verify := ""
+	if meas > 0 {
+		verify = fmt.Sprintf(", your circuit %.1f", meas)
+	}
+	o.logf(fmt.Sprintf("BEST EXIT PINNED: %s (score %.1f%s Mbit/s) – %d old circuits closed, tabs switch automatically",
+		best.name, best.mean, verify, closed))
 }
 
 // ---------- Watch ----------
@@ -1464,11 +1829,27 @@ type server struct {
 	// fastest score found so far in the running hunt (gamified display)
 	huntBestMB   float64
 	huntBestName string
+	huntProbe    bool // running hunt measures on the probe daemon
+	aborted      bool // set by /api/abort – suppresses boost restart
 	url          string
 	target       float64
 	candidates   int
 	maxMB        int64
 	samples      int
+	// dedicated measuring tor – never in s.daemons (browser PAC ports)
+	probe      *daemon
+	probeCmd   *exec.Cmd
+	probeState string // "starting" / "ready" / "unavailable: reason"
+	probeTried time.Time
+	// background optimizer
+	boostAuto     bool
+	boosting      bool
+	boostGen      int // bumped per startBoost – stale loops must not clear
+	boostCancel   context.CancelFunc
+	boostProbes   int
+	boostSwitches int
+	board         *board
+	lastSwitch    time.Time
 }
 
 // discoverDaemons returns s.discover() or falls back to discoverAll.
@@ -1589,30 +1970,57 @@ func (s *server) startHunt() {
 		return
 	}
 	s.hunting = true
+	s.aborted = false
 	s.huntBestMB, s.huntBestName = 0, ""
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 	s.mu.Unlock()
+	s.stopBoost() // restarts after the hunt when boostAuto is on
 
 	go func() {
-		defer func() {
-			s.mu.Lock()
-			s.hunting = false
-			s.mu.Unlock()
-			s.ensureDirect() // refresh the baseline after a hunt
-		}()
-		_, _, best := hunt(ctx, d, s.target, s.candidates, s.url, s.maxMB, s.samples,
-			func(m string) { s.logf("%s", m) },
-			func(name string, v float64) {
+		// A probe spawn may still be in flight – give it a moment,
+		// then fall back to measuring on the browsing daemon.
+		probe := s.probeFor(60 * time.Second)
+		s.mu.Lock()
+		s.huntProbe = probe != nil
+		s.mu.Unlock()
+		if probe == nil {
+			s.logf("no probe daemon – hunting in place (browsing may stall briefly)")
+		}
+		best, results := hunt(ctx, d, huntOpts{
+			target: s.target, candidates: s.candidates, url: s.url,
+			maxMB: s.maxMB, samples: s.samples, probe: probe,
+			logf: func(m string) { s.logf("%s", m) },
+			prog: func(name string, v float64) {
 				s.hub.pub(fmt.Sprintf(`{"type":"prog","v":%.1f,"name":%q}`, v, name))
 			},
-			s.onHuntBest)
-		if best > 0 {
-			s.mu.Lock()
-			s.bestMB = best
+			onBest: s.onHuntBest,
+			aborted: func() bool {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				return s.aborted
+			}})
+		s.mu.Lock()
+		if best.mean > 0 {
+			s.bestMB = best.mean
 			s.bestAt = time.Now().Unix()
+		}
+		aborted := s.aborted
+		s.hunting = false
+		s.mu.Unlock()
+		if best.mean > 0 {
+			s.hub.pub(fmt.Sprintf(`{"type":"mbps","v":%.1f}`, best.mean))
+		}
+		s.ensureDirect() // refresh the baseline after a hunt
+		// carry the hunt results into the background optimizer
+		if best.fp != "" && !aborted {
+			s.mu.Lock()
+			if s.board == nil {
+				s.board = newBoard()
+			}
+			s.board.seed(best.fp, results, time.Now())
 			s.mu.Unlock()
-			s.hub.pub(fmt.Sprintf(`{"type":"mbps","v":%.1f}`, best))
+			s.startBoost()
 		}
 	}()
 }
@@ -1658,24 +2066,34 @@ func (s *server) measure() {
 		s.logf("measuring …")
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		res, err := speedTest(ctx, probeOpts{
-			socks:   socks,
-			urls:    testURLList(s.url),
-			maxMB:   s.maxMB,
-			streams: 3,
-			prog: func(name string, v float64) {
+		// expect = the pinned exit's board mean: a clearly worse result
+		// means the stream landed on a bad circuit → re-roll it.
+		pin := pinnedExit(c)
+		expect := 0.0
+		if pin != "" {
+			s.mu.Lock()
+			bd := s.board
+			s.mu.Unlock()
+			if bd != nil {
+				expect, _ = bd.mean(pin)
+			}
+		}
+		v, err := browserProbe(ctx, c, socks, pin, expect,
+			testURLList(s.url), s.maxMB,
+			func(name string, v float64) {
 				s.hub.pub(fmt.Sprintf(`{"type":"prog","v":%.1f,"name":%q}`, v, name))
-			}})
+			},
+			func(m string) { s.logf("%s", m) })
 		if err != nil {
 			s.logf("measurement failed: %v", err)
 			return
 		}
 		s.mu.Lock()
-		s.lastMB = res.mbps
+		s.lastMB = v
 		s.lastAt = time.Now().Unix()
 		s.mu.Unlock()
-		s.hub.pub(fmt.Sprintf(`{"type":"mbps","v":%.1f}`, res.mbps))
-		s.logf("measured %.1f Mbit/s", res.mbps)
+		s.hub.pub(fmt.Sprintf(`{"type":"mbps","v":%.1f}`, v))
+		s.logf("measured %.1f Mbit/s", v)
 	}()
 }
 
@@ -1699,7 +2117,7 @@ func (s *server) ensureDirect() {
 		defer cancel()
 		// Baseline: fast fallback URLs, 6 streams – comparable to
 		// multi-stream speedtests like fast.com.
-		res, err := speedTest(ctx, probeOpts{
+		res, err := speedTestFn(ctx, probeOpts{
 			urls:    testURLs,
 			maxMB:   25,
 			maxDur:  5 * time.Second,
@@ -1729,7 +2147,7 @@ func compareDaemons(ds []*daemon, url string,
 			if socks != "" {
 				ctx, cancel := context.WithTimeout(
 					context.Background(), 30*time.Second)
-				if res, err := speedTest(ctx, probeOpts{
+				if res, err := speedTestFn(ctx, probeOpts{
 					socks:   socks,
 					isolate: isolationToken(),
 					urls:    testURLList(url),
@@ -1784,6 +2202,503 @@ func (s *server) compare() {
 	}
 }
 
+// ---------- Probe daemon ----------
+
+// spawnProbeFn is a variable so tests never launch a real tor.
+var spawnProbeFn = spawnProbeTor
+
+// ensureProbe keeps the dedicated measuring tor alive: spawn once, wait
+// for readiness, re-spawn lazily when it stops answering (throttled to
+// one attempt per 60 s). It never joins s.daemons, so the browser's PAC
+// list never sends traffic over it.
+func (s *server) ensureProbe() {
+	for {
+		s.mu.Lock()
+		pr, tried := s.probe, s.probeTried
+		s.mu.Unlock()
+		if pr != nil && probeDaemon(pr.addr) != nil {
+			time.Sleep(10 * time.Second)
+			continue // alive
+		}
+		if pr != nil { // stopped answering – mark before re-spawn throttle
+			s.mu.Lock()
+			s.probe, s.probeState = nil, "unavailable: died"
+			s.mu.Unlock()
+		}
+		if time.Since(tried) < 60*time.Second {
+			time.Sleep(10 * time.Second)
+			continue // throttle re-spawns
+		}
+		s.mu.Lock()
+		s.probeState = "starting"
+		s.probeTried = time.Now()
+		s.mu.Unlock()
+		home, _ := os.UserHomeDir()
+		d, cmd, err := spawnProbeFn(filepath.Join(home, ".torspeed", "probe"))
+		if err != nil {
+			s.mu.Lock()
+			s.probeState = "unavailable: " + err.Error()
+			s.probe, s.probeCmd = nil, nil
+			s.mu.Unlock()
+			if cmd != nil && cmd.Process != nil {
+				cmd.Process.Kill()
+			}
+			continue
+		}
+		if !waitReady(d, 180*time.Second) {
+			s.mu.Lock()
+			s.probeState = "unavailable: bootstrap timeout"
+			s.mu.Unlock()
+			if cmd != nil && cmd.Process != nil {
+				cmd.Process.Kill()
+			}
+			continue
+		}
+		s.mu.Lock()
+		s.probe, s.probeCmd, s.probeState = d, cmd, "ready"
+		s.mu.Unlock()
+		s.logf("probe daemon ready (%s)", d.addr)
+	}
+}
+
+// probeFor returns the ready probe daemon, waiting up to timeout while a
+// spawn is still in flight ("starting").
+func (s *server) probeFor(timeout time.Duration) *daemon {
+	deadline := time.Now().Add(timeout)
+	for {
+		s.mu.Lock()
+		pr, st := s.probe, s.probeState
+		s.mu.Unlock()
+		if st == "ready" {
+			return pr
+		}
+		if st != "starting" || time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// ---------- Boost (background optimizer) ----------
+
+// Everything worse than the incumbent – or without potential – goes away.
+const (
+	potentialRatio = 0.8              // contender mean below this × incumbent → drop
+	switchRatio    = 1.15             // switch only at this × incumbent mean
+	coolDur        = 30 * time.Minute // stay dropped this long
+	sampleTTL      = 20 * time.Minute // samples older than this don't count
+	minSwitchGap   = 2 * time.Minute  // min time between exit switches
+)
+
+// exitStat holds the newest ≤6 samples of one exit.
+type exitStat struct {
+	name string
+	vals []float64 // vals[i] measured at ts[i]
+	ts   []time.Time
+}
+
+// board tracks what the boost loop learned: the incumbent pin, per-exit
+// samples and cooled rejects. All methods are mutex-guarded.
+type board struct {
+	mu    sync.Mutex
+	inc   string
+	stats map[string]*exitStat
+	cool  map[string]time.Time // fp → cooled until
+	names map[string]string    // fp → nickname (survives sample expiry)
+}
+
+func newBoard() *board {
+	return &board{stats: map[string]*exitStat{},
+		cool: map[string]time.Time{}, names: map[string]string{}}
+}
+
+func (b *board) addLocked(fp, name string, v float64, now time.Time) {
+	st := b.stats[fp]
+	if st == nil {
+		st = &exitStat{}
+		b.stats[fp] = st
+	}
+	if name != "" {
+		st.name = name
+		b.names[fp] = name
+	}
+	st.vals = append(st.vals, v)
+	st.ts = append(st.ts, now)
+	if len(st.vals) > 6 {
+		st.vals = append([]float64(nil), st.vals[len(st.vals)-6:]...)
+		st.ts = append([]time.Time(nil), st.ts[len(st.ts)-6:]...)
+	}
+}
+
+func (b *board) add(fp, name string, v float64, now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.addLocked(fp, name, v, now)
+}
+
+func (b *board) meanLocked(fp string) (float64, int) {
+	st := b.stats[fp]
+	if st == nil || len(st.vals) == 0 {
+		return 0, 0
+	}
+	var s float64
+	for _, v := range st.vals {
+		s += v
+	}
+	return s / float64(len(st.vals)), len(st.vals)
+}
+
+// mean returns the fp's sample mean and count (0,0 when unknown).
+func (b *board) mean(fp string) (float64, int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.meanLocked(fp)
+}
+
+func (b *board) pruneLocked(now time.Time) {
+	for fp, until := range b.cool {
+		if !now.Before(until) {
+			delete(b.cool, fp)
+		}
+	}
+	for fp, st := range b.stats {
+		i := 0
+		for i < len(st.ts) && now.Sub(st.ts[i]) > sampleTTL {
+			i++
+		}
+		if i > 0 {
+			st.vals = append([]float64(nil), st.vals[i:]...)
+			st.ts = append([]time.Time(nil), st.ts[i:]...)
+		}
+		if len(st.vals) == 0 {
+			delete(b.stats, fp)
+		}
+	}
+	incMean, incN := b.meanLocked(b.inc)
+	if incN == 0 {
+		return // nothing to measure potential against
+	}
+	for fp, st := range b.stats {
+		if fp == b.inc || len(st.vals) == 0 {
+			continue
+		}
+		var sum float64
+		for _, v := range st.vals {
+			sum += v
+		}
+		if sum/float64(len(st.vals)) < potentialRatio*incMean {
+			delete(b.stats, fp)
+			b.cool[fp] = now.Add(coolDur)
+		}
+	}
+}
+
+// prune drops expired samples and empty entries, expires cool-downs, and
+// cools every contender without potential (mean < 0.8 × incumbent).
+func (b *board) prune(now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.pruneLocked(now)
+}
+
+// cooldown drops an exit's stats and parks it for coolDur.
+func (b *board) cooldown(fp string, now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.stats, fp)
+	b.cool[fp] = now.Add(coolDur)
+}
+
+func (b *board) incumbent() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.inc
+}
+
+func (b *board) setInc(fp string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.inc = fp
+}
+
+func (b *board) nameOf(fp string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.names[fp]
+}
+
+// next picks the next boost candidate: the incumbent is re-tested when
+// it has no samples and every 3rd round (it rots too); otherwise a
+// contender with exactly one sample gets its confirmation probe first;
+// else a random pool relay that is neither incumbent, cooled nor scored.
+func (b *board) next(pool []relay, round int, now time.Time) (relay, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, incN := b.meanLocked(b.inc); incN == 0 || round%3 == 0 {
+		if b.inc == "" {
+			return relay{}, false
+		}
+		return relay{fp: b.inc, name: b.names[b.inc]}, true
+	}
+	var one []string
+	for fp, st := range b.stats {
+		if fp != b.inc && len(st.vals) == 1 {
+			one = append(one, fp)
+		}
+	}
+	if len(one) > 0 {
+		sort.Strings(one) // deterministic order for tests
+		return relay{fp: one[0], name: b.stats[one[0]].name}, true
+	}
+	var fresh []relay
+	for _, r := range pool {
+		if r.fp == b.inc {
+			continue
+		}
+		if until, ok := b.cool[r.fp]; ok && now.Before(until) {
+			continue
+		}
+		if _, ok := b.stats[r.fp]; ok {
+			continue
+		}
+		fresh = append(fresh, r)
+	}
+	if len(fresh) == 0 {
+		return relay{}, false
+	}
+	return fresh[mrand.Intn(len(fresh))], true
+}
+
+// switchTo reports a contender worth switching to: ≥2 samples, mean at
+// least switchRatio above the incumbent's, and the minimum gap since the
+// last switch respected.
+func (b *board) switchTo(now, lastSwitch time.Time) (string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if now.Sub(lastSwitch) < minSwitchGap {
+		return "", false
+	}
+	incMean, incN := b.meanLocked(b.inc)
+	if incN == 0 || incMean <= 0 {
+		return "", false
+	}
+	bestFP, bestM := "", 0.0
+	for fp, st := range b.stats {
+		if fp == b.inc || len(st.vals) < 2 {
+			continue
+		}
+		var sum float64
+		for _, v := range st.vals {
+			sum += v
+		}
+		if m := sum / float64(len(st.vals)); m >= switchRatio*incMean &&
+			m > bestM {
+			bestFP, bestM = fp, m
+		}
+	}
+	return bestFP, bestFP != ""
+}
+
+// seed initialises the board from a finished hunt: the winner becomes
+// the incumbent, every measured value is kept, then pruned.
+func (b *board) seed(inc string, results []exitScore, now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.inc = inc
+	for _, r := range results {
+		for _, v := range r.vals {
+			b.addLocked(r.fp, r.name, v, now)
+		}
+	}
+	b.pruneLocked(now)
+}
+
+// nextBoostInterval backs off exponentially (×1.5) up to 5 min; a fresh
+// switch (or the first round) re-checks soon, at 20 s.
+func nextBoostInterval(cur time.Duration, switched bool) time.Duration {
+	if switched || cur <= 0 {
+		return 20 * time.Second
+	}
+	if n := cur * 3 / 2; n < 5*time.Minute {
+		return n
+	}
+	return 5 * time.Minute
+}
+
+// startBoost launches the background optimizer – idempotent, only with
+// a ready probe and an active pin (the incumbent), never while hunting.
+func (s *server) startBoost() {
+	s.mu.Lock()
+	if s.boosting || s.hunting || !s.boostAuto {
+		s.mu.Unlock()
+		return
+	}
+	pr, st := s.probe, s.probeState
+	s.mu.Unlock()
+	if pr == nil || st != "ready" {
+		return
+	}
+	d := s.daemon()
+	if d == nil {
+		return
+	}
+	c, err := d.connect()
+	if err != nil {
+		return
+	}
+	inc := pinnedExit(c)
+	c.close()
+	if inc == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.board == nil || s.board.incumbent() != inc {
+		nb := newBoard()
+		nb.seed(inc, nil, time.Now())
+		s.board = nb
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.boosting = true
+	s.boostGen++
+	s.boostCancel = cancel
+	s.lastSwitch = time.Now()
+	gen := s.boostGen
+	s.mu.Unlock()
+	s.logf("boost: keeps searching in the background")
+	go s.boostLoop(ctx, gen)
+}
+
+func (s *server) stopBoost() {
+	s.mu.Lock()
+	if s.boostCancel != nil {
+		s.boostCancel()
+	}
+	s.boosting, s.boostCancel = false, nil
+	s.mu.Unlock()
+}
+
+// boostLoop keeps probing exits on the probe daemon while the user
+// surfs undisturbed; a contender that clearly beats the incumbent gets
+// switched in gracefully (warm first, then sweep). Gives up after 60 min
+// without an improvement.
+func (s *server) boostLoop(ctx context.Context, gen int) {
+	defer func() {
+		s.mu.Lock()
+		if s.boostGen == gen { // don't clear a newer generation
+			s.boosting, s.boostCancel = false, nil
+		}
+		s.mu.Unlock()
+	}()
+	interval := time.Duration(0)
+	switched := false
+	round := 0
+	var pool []relay
+	poolAt := time.Time{}
+	for ctx.Err() == nil {
+		interval = nextBoostInterval(interval, switched)
+		switched = false
+		sleepCtx(ctx, interval)
+		if ctx.Err() != nil {
+			return
+		}
+		s.mu.Lock()
+		if s.hunting || s.measuring {
+			s.mu.Unlock()
+			continue
+		}
+		pr, st, bd, lastSw := s.probe, s.probeState, s.board, s.lastSwitch
+		s.mu.Unlock()
+		if !lastSw.IsZero() && time.Since(lastSw) > 60*time.Minute {
+			s.logf("boost idle 60 min – stopped")
+			return
+		}
+		if pr == nil || st != "ready" || bd == nil {
+			continue
+		}
+		pc, err := pr.connect()
+		if err != nil {
+			continue // ensureProbe respawns it
+		}
+		socks, _ := socksAddr(pc)
+		if socks == "" {
+			pc.close()
+			continue
+		}
+		now := time.Now()
+		if len(pool) == 0 || now.Sub(poolAt) > 30*time.Minute {
+			if p, err := topExits(pc, 60); err == nil && len(p) > 0 {
+				pool, poolAt = p, now
+			}
+		}
+		cand, ok := bd.next(pool, round, now)
+		if !ok {
+			pc.close()
+			continue
+		}
+		round++
+		incMean, _ := bd.mean(bd.incumbent())
+		prepareExit(pc, cand.fp)
+		res, err := isolatedSample(ctx, pc, socks, cand.fp,
+			testURLList(s.url), 10, 6*time.Second, cand.name, nil,
+			0.7*incMean)
+		switch {
+		case errors.Is(err, errWrongExit):
+			// landed on a stale conflux set – just skip it
+		case err != nil:
+			bd.cooldown(cand.fp, now)
+		default:
+			bd.add(cand.fp, cand.name, res.mbps, time.Now())
+			bd.prune(time.Now())
+			s.mu.Lock()
+			s.boostProbes++
+			s.mu.Unlock()
+			if cand.fp == bd.incumbent() {
+				m, _ := bd.mean(cand.fp)
+				s.mu.Lock()
+				s.bestMB, s.bestAt = m, time.Now().Unix()
+				s.mu.Unlock()
+			}
+		}
+		pc.close()
+		if err != nil {
+			continue
+		}
+		fp, ok := bd.switchTo(time.Now(), lastSw)
+		if !ok {
+			continue
+		}
+		d := s.daemon()
+		if d == nil {
+			continue
+		}
+		dc, err := d.connect()
+		if err != nil {
+			continue
+		}
+		bsocks, _ := socksAddr(dc)
+		cm, _ := bd.mean(fp)
+		incMean, _ = bd.mean(bd.incumbent())
+		_, aerr := applyExit(ctx, dc, bsocks, fp, "")
+		dc.close()
+		if aerr != nil {
+			s.logf("BOOST: switch failed: %s", aerr)
+			bd.cooldown(fp, time.Now())
+			continue
+		}
+		bd.setInc(fp)
+		swAt := time.Now()
+		s.mu.Lock()
+		s.lastSwitch = swAt
+		s.boostSwitches++
+		s.bestMB, s.bestAt = cm, swAt.Unix()
+		s.mu.Unlock()
+		s.hub.pub(fmt.Sprintf(`{"type":"mbps","v":%.1f}`, cm))
+		s.logf("BOOST: switched to %s (%.1f → %.1f Mbit/s)",
+			bd.nameOf(fp), incMean, cm)
+		switched = true
+	}
+}
+
 func (s *server) api(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
@@ -1797,6 +2712,9 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 		hunting, last, best, direct := s.hunting, s.lastMB, s.bestMB, s.directMB
 		lastAt, bestAt := s.lastAt, s.bestAt
 		huntBestMB, huntBestName := s.huntBestMB, s.huntBestName
+		boosting, boostAuto := s.boosting, s.boostAuto
+		boostProbes, boostSwitches := s.boostProbes, s.boostSwitches
+		probeState := s.probeState
 		s.mu.Unlock()
 		if needDirect {
 			s.ensureDirect() // first status poll fills the baseline once
@@ -1842,8 +2760,12 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 			"exit_ip": exitIP, "exit_name": exitName,
 			"proxy": proxyState(), "direct_mbps": direct,
 			"daemon": dName, "daemons": dlist,
+			"boost": boosting, "boost_auto": boostAuto,
+			"boost_probes": boostProbes, "boost_switches": boostSwitches,
+			"probe": probeState,
 		})
 	case "/api/daemon":
+		s.stopBoost() // the pin lives on the old daemon – stats stay, loop stops
 		addr := r.FormValue("addr")
 		s.dmu.Lock()
 		for _, dd := range s.daemons {
@@ -1890,10 +2812,12 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	case "/api/abort":
 		s.mu.Lock()
+		s.aborted = true
 		if s.cancel != nil {
 			s.cancel()
 		}
 		s.mu.Unlock()
+		s.stopBoost()
 		go func() {
 			for i := 0; i < 60; i++ {
 				s.mu.Lock()
@@ -1914,6 +2838,7 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 	case "/api/unpin":
+		s.stopBoost()
 		go func() {
 			if d := s.daemon(); d != nil {
 				if c, err := d.connect(); err == nil {
@@ -1926,6 +2851,25 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 		}()
 	case "/api/measure":
 		s.measure()
+	case "/api/boost":
+		if on := r.FormValue("on"); on != "" {
+			s.mu.Lock()
+			s.boostAuto = on == "1" || on == "true" || on == "on"
+			s.mu.Unlock()
+		}
+		s.mu.Lock()
+		auto := s.boostAuto
+		s.mu.Unlock()
+		if auto {
+			s.startBoost()
+		} else {
+			s.stopBoost()
+		}
+		s.mu.Lock()
+		running := s.boosting
+		s.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"boost": running, "boost_auto": auto})
 	case "/api/open":
 		if err := openBrowser(); err != nil {
 			s.logf("browser start: %v", err)
@@ -2017,6 +2961,7 @@ label{color:#bbb;font-size:14px}
 <div id=stat></div>
 <div>Tor daemon: <select id=ds></select><a id=vs>Compare</a></div>
 <label><input type=checkbox id=vc> System proxy → Tor</label><br>
+<label><input type=checkbox id=bc> Keep improving in background</label><br>
 <button id=h onclick=hunt()>Find fastest exit</button>
 <button class=sec id=n onclick=unpin()>Unpin exit</button>
 <button class=sec id=m onclick=post('measure')>Measure</button>
@@ -2086,6 +3031,10 @@ const poll=()=>fetch('/api/status').then(r=>r.json()).then(s=>{
    o.textContent=x.name+(x.ready?'':' (not ready)');ds.appendChild(o)});}
  dl.forEach(x=>{if(s.daemon&&s.daemon.indexOf(x.addr)>=0)ds.value=x.addr});
  document.getElementById('vc').checked=!!s.proxy;
+ document.getElementById('bc').checked=!!s.boost_auto;
+ if(s.boost&&!hunting)document.getElementById('meta').textContent=
+  'boost: '+(s.boost_probes||0)+' probes · '+(s.boost_switches||0)+
+  ' switch'+((s.boost_switches||0)==1?'':'es');
  document.getElementById('eip').textContent=s.exit_ip?'exit IP '+s.exit_ip+
   (s.exit_name?' ('+s.exit_name+')':''):'';
 }).catch(()=>{document.getElementById('stat').textContent='offline';});
@@ -2095,6 +3044,10 @@ document.getElementById('vs').onclick=()=>post('compare');
 document.getElementById('vc').onchange=e=>
  fetch('/api/proxy?on='+(e.target.checked?1:0),{method:'POST'})
  .then(r=>r.json()).then(d=>{e.target.checked=d.proxy})
+ .catch(()=>{e.target.checked=!e.target.checked});
+document.getElementById('bc').onchange=e=>
+ fetch('/api/boost?on='+(e.target.checked?1:0),{method:'POST'})
+ .then(r=>r.json()).then(d=>{e.target.checked=d.boost_auto})
  .catch(()=>{e.target.checked=!e.target.checked});
 const es=new EventSource('/events');
 const bws=[];
@@ -2115,11 +3068,39 @@ poll();setInterval(poll,5000);
 
 func (s *server) run(port int) error {
 	go s.bwPump()
+	go s.ensureProbe() // dedicated measuring tor for hunts + boost
 	// Keep the system proxy pointed at a ready daemon's current port.
 	go func() {
 		for range time.Tick(30 * time.Second) {
 			s.daemon()
 			s.proxyCheck()
+		}
+	}()
+	// Pin enforcement: circuits can still appear on a stale exit a moment
+	// after a pin (late conflux legs) – sweep them, except while an
+	// in-place hunt is deliberately re-pinning the browsing daemon.
+	go func() {
+		for range time.Tick(10 * time.Second) {
+			s.mu.Lock()
+			inPlace := s.hunting && !s.huntProbe
+			s.mu.Unlock()
+			if inPlace {
+				continue
+			}
+			d := s.daemon()
+			if d == nil {
+				continue
+			}
+			c, err := d.connect()
+			if err != nil {
+				continue
+			}
+			if fp := pinnedExit(c); fp != "" {
+				if n := sweepWrongExit(c, fp); n > 0 {
+					s.logf("closed %d circuits on stale exits", n)
+				}
+			}
+			c.close()
 		}
 	}()
 	mux := http.NewServeMux()
@@ -2144,6 +3125,13 @@ func (s *server) run(port int) error {
 		srv.Close() // hard close: SSE connections must not block shutdown
 	}()
 	err := srv.ListenAndServe()
+	s.stopBoost()
+	s.mu.Lock()
+	pc := s.probeCmd
+	s.mu.Unlock()
+	if pc != nil && pc.Process != nil {
+		pc.Process.Kill() // (it also dies via __OwningControllerProcess)
+	}
 	if err == http.ErrServerClosed {
 		return nil
 	}
@@ -2401,7 +3389,7 @@ func main() {
 		s := &server{d: d, daemons: discoverAll(), discover: discoverAll,
 			hub: &hub{clients: map[chan string]bool{}},
 			url: *fURL, target: *fTarget, candidates: *fCands, maxMB: *fMaxMB,
-			samples: *fSamples}
+			samples: *fSamples, boostAuto: true}
 		fatal(s.run(*fPort))
 	}
 	if err != nil {
@@ -2444,13 +3432,15 @@ func main() {
 		if hit == nil {
 			fatal(fmt.Errorf("relay '%s' not found", *fExit))
 		}
-		pin(c, hit.fp)
-		closed := closeStaleCircuits(c, hit.fp)
-		fmt.Printf("%d old circuits closed – tabs switch automatically\n", closed)
-		c.cmd("SIGNAL NEWNYM")
-		time.Sleep(4 * time.Second)
 		socks, _ := socksAddr(c)
-		res, err := speedTest(ctx, probeOpts{
+		// Warms the new exit's circuit first, then sweeps the old ones –
+		// open tabs switch to the pin without a reload.
+		closed, aerr := applyExit(ctx, c, socks, hit.fp, "")
+		if aerr != nil {
+			fatal(aerr)
+		}
+		fmt.Printf("%d old circuits closed – tabs switch automatically\n", closed)
+		res, err := speedTestFn(ctx, probeOpts{
 			socks: socks, urls: testURLList(*fURL), maxMB: *fMaxMB, streams: 3,
 			prog: func(_ string, v float64) {
 				fmt.Printf("\r  measuring: %6.1f Mbit/s  ", v)
@@ -2468,18 +3458,19 @@ func main() {
 		showCircuits(c)
 		c.close()
 	case *fHunt:
-		_, _, _ = hunt(ctx, d, *fTarget, *fCands, *fURL, *fMaxMB, *fSamples,
-			func(m string) { fmt.Println(m) },
-			func(name string, v float64) {
+		hunt(ctx, d, huntOpts{target: *fTarget, candidates: *fCands,
+			url: *fURL, maxMB: *fMaxMB, samples: *fSamples,
+			logf: func(m string) { fmt.Println(m) },
+			prog: func(name string, v float64) {
 				fmt.Printf("\r  measuring %s: %6.1f Mbit/s          ", name, v)
-			}, nil)
+			}})
 	default:
 		c, err := d.connect()
 		if err != nil {
 			fatal(err)
 		}
 		socks, _ := socksAddr(c)
-		res, err := speedTest(ctx, probeOpts{
+		res, err := speedTestFn(ctx, probeOpts{
 			socks: socks, urls: testURLList(*fURL), maxMB: *fMaxMB, streams: 3,
 			prog: func(_ string, v float64) {
 				fmt.Printf("\r  measuring: %6.1f Mbit/s  ", v)
