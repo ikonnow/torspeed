@@ -44,10 +44,19 @@ async function proxyInfo(){
 const fail=st=>{st.on=false;st.noTor=false;st.error='controlled_by_other';
  chrome.storage.local.set({on:false});return st;};
 
+// Serialize every proxy-state operation: tick, popup polls, toggles and
+// proxy-error retries must never interleave storage reads with settings
+// writes – a stale run could otherwise re-set what a newer toggle just
+// cleared, or un-check the popup switch after it was turned on.
+let pq=Promise.resolve();
+const enqueue=f=>{const r=pq.then(f);pq=r.then(()=>{},()=>{});return r;};
+const syncProxy=s=>enqueue(()=>syncProxyRun(s));
+const setProxy=on=>enqueue(()=>setProxyRun(on));
+
 // Intent on = stored flag OR we already control the proxy (legacy
 // fixed_servers counts – it is migrated to PAC below).
-async function syncProxy(status){
- const st=await chrome.storage.local.get({on:false,ports:[],noTor:false});
+async function syncProxyRun(status){
+ const st=await chrome.storage.local.get({on:false,ports:[],noTor:false,gen:0});
  if(status===undefined)status=await fetchStatus();
  const info=await proxyInfo();
  const havePac=info.controlled&&info.mode=='pac_script';
@@ -71,15 +80,17 @@ async function syncProxy(status){
  await chrome.storage.local.set({on:true,ports:st.ports,noTor:st.noTor});
  return st;}
 
-async function setProxy(on){
+async function setProxyRun(on){
+ // gen marks each intent change; replies carrying an older gen are stale.
+ const g=(await chrome.storage.local.get({gen:0})).gen+1;
  if(on){
   chrome.privacy.network.webRTCIPHandlingPolicy.set({value:'disable_non_proxied_udp'});
-  await chrome.storage.local.set({on:true});
-  return syncProxy();}
+  await chrome.storage.local.set({on:true,gen:g});
+  return syncProxyRun();}
  await chrome.proxy.settings.clear({scope:'regular'});
  chrome.privacy.network.webRTCIPHandlingPolicy.clear({});
- await chrome.storage.local.set({on:false,ports:[],noTor:false});
- return{on:false,ports:[],noTor:false};}
+ await chrome.storage.local.set({on:false,ports:[],noTor:false,gen:g});
+ return{on:false,ports:[],noTor:false,gen:g};}
 
 // onProxyError fires per failed request (every failover off a dead
 // port) – throttle to one sync per 5 s, reusing an in-flight run.

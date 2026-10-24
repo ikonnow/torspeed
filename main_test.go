@@ -14,6 +14,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -308,6 +311,9 @@ func TestParseConsensus(t *testing.T) {
 	}
 	if !rs[0].exit || !rs[0].running || rs[0].bw != 50000 || rs[0].pol != "accept 80,443" {
 		t.Fatalf("relay 0 fields: %+v", rs[0])
+	}
+	if rs[0].ip != "1.2.3.4" || rs[1].ip != "5.6.7.8" {
+		t.Fatalf("OR address not parsed: %q %q", rs[0].ip, rs[1].ip)
 	}
 	if rs[1].exit || rs[1].pol != "" {
 		t.Fatalf("relay 1 fields: %+v", rs[1])
@@ -722,7 +728,8 @@ func TestAPIStatus(t *testing.T) {
 	for _, k := range []string{"hunting", "last_mbps", "best_mbps", "pinned_exit",
 		"pinned_name", "socks", "proxy", "direct_mbps", "daemon", "daemons",
 		"last_at", "best_at", "hunt_best_mbps", "hunt_best_name",
-		"exit_ip", "exit_name"} {
+		"exit_ip", "exit_name", "boost", "boost_auto", "boost_probes",
+		"boost_switches", "probe"} {
 		if _, ok := m[k]; !ok {
 			t.Errorf("missing key %q in %v", k, m)
 		}
@@ -932,10 +939,10 @@ func TestOnHuntBest(t *testing.T) {
 	}
 }
 
-// TestCloseStaleCircuits: only BUILT GENERAL/CONFLUX_LINKED circuits on a
+// TestSweepWrongExit: only BUILT GENERAL/CONFLUX_* circuits on a
 // different exit are closed; the pinned exit's circuits, hidden-service
 // and still-extending circuits are kept.
-func TestCloseStaleCircuits(t *testing.T) {
+func TestSweepWrongExit(t *testing.T) {
 	var mu sync.Mutex
 	var cmds []string
 	other := "$EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE~other"
@@ -953,21 +960,22 @@ func TestCloseStaleCircuits(t *testing.T) {
 				"3 BUILT " + a + "," + other + " PURPOSE=HS_CLIENT_REND",
 				"4 EXTENDED " + a + "," + other + " PURPOSE=GENERAL",
 				"5 BUILT " + a + "," + other + " PURPOSE=CONFLUX_LINKED",
+				"6 BUILT " + a + "," + other + " PURPOSE=CONFLUX_UNLINKED",
 				".",
 				"250 OK",
 			}
 		}
 		return []string{"250 OK"}
 	})
-	n := closeStaleCircuits(c,
+	n := sweepWrongExit(c,
 		"KEEPFP0000000000000000000000000000000000")
-	if n != 2 {
-		t.Fatalf("closed = %d, want 2", n)
+	if n != 3 {
+		t.Fatalf("closed = %d, want 3", n)
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	want := []string{"GETINFO circuit-status",
-		"CLOSECIRCUIT 1", "CLOSECIRCUIT 5"}
+		"CLOSECIRCUIT 1", "CLOSECIRCUIT 5", "CLOSECIRCUIT 6"}
 	if len(cmds) != len(want) {
 		t.Fatalf("cmds = %v, want %v", cmds, want)
 	}
@@ -1108,5 +1116,895 @@ func TestExtensionEmbedded(t *testing.T) {
 	}
 	if m["name"] != "torspeed" {
 		t.Fatalf("manifest name = %v", m["name"])
+	}
+}
+
+// ---------- circuit parsing / pin ----------
+
+func TestParseCirc(t *testing.T) {
+	g := "$" + strings.ToLower(fpHex(0x11)) + "~guard"
+	m := "$" + strings.ToLower(fpHex(0x22)) + "=middle"
+	e := "$" + strings.ToLower(fpHex(0x33)) + "~exit"
+	ci, ok := parseCirc("17 BUILT " + g + "," + m + "," + e +
+		" BUILD_FLAGS=NEED_CAPACITY PURPOSE=CONFLUX_UNLINKED " +
+		`SOCKS_USERNAME="tokA" SOCKS_PASSWORD="x"`)
+	if !ok {
+		t.Fatal("parseCirc failed")
+	}
+	if ci.id != "17" || ci.status != "BUILT" ||
+		ci.purpose != "CONFLUX_UNLINKED" || ci.user != "tokA" {
+		t.Fatalf("parsed = %+v", ci)
+	}
+	want := []string{fpHex(0x11), fpHex(0x22), fpHex(0x33)}
+	if strings.Join(ci.path, ",") != strings.Join(want, ",") {
+		t.Fatalf("path = %v, want %v", ci.path, want)
+	}
+	if ci.exit() != fpHex(0x33) {
+		t.Fatalf("exit = %q", ci.exit())
+	}
+	ci, ok = parseCirc("9 BUILT " + g + "," + e + " PURPOSE=GENERAL")
+	if !ok || ci.user != "" || ci.purpose != "GENERAL" {
+		t.Fatalf("parsed = %+v ok=%v", ci, ok)
+	}
+	for _, bad := range []string{"", "garbage", "1 BUILT", "x BUILT $aa~a"} {
+		if _, ok := parseCirc(bad); ok {
+			t.Errorf("parseCirc(%q) unexpectedly ok", bad)
+		}
+	}
+}
+
+// TestApplyExit: warm-up succeeds → pin + sweep; never SIGNAL NEWNYM.
+func TestApplyExit(t *testing.T) {
+	fp, prev := fpHex(0xAA), fpHex(0xEE)
+	socks := fakeSocks(t, 0)
+	var mu sync.Mutex
+	var cmds []string
+	c := fakeCtrl(t, func(cmd string) []string {
+		mu.Lock()
+		cmds = append(cmds, cmd)
+		mu.Unlock()
+		switch cmd {
+		case "GETCONF ExitNodes":
+			return []string{"250-ExitNodes=$" + prev, "250 OK"}
+		case "GETINFO circuit-status":
+			return []string{"250+circuit-status=",
+				"1 BUILT $" + fpHex(0x01) + "~g,$" + fpHex(0xCC) +
+					"~e PURPOSE=GENERAL",
+				"2 BUILT $" + fpHex(0x01) + "~g,$" + fp +
+					"~e PURPOSE=GENERAL",
+				".", "250 OK"}
+		}
+		return []string{"250 OK"}
+	})
+	closed, err := applyExit(context.Background(), c, socks, fp, "h:443")
+	if err != nil {
+		t.Fatalf("applyExit: %v", err)
+	}
+	if closed != 1 {
+		t.Fatalf("closed = %d, want 1", closed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"GETCONF ExitNodes", "SETCONF ExitNodes=$" + fp,
+		"GETINFO circuit-status", "CLOSECIRCUIT 1"}
+	if strings.Join(cmds, "|") != strings.Join(want, "|") {
+		t.Fatalf("cmds = %v, want %v", cmds, want)
+	}
+	for _, cmd := range cmds {
+		if strings.Contains(cmd, "NEWNYM") {
+			t.Fatalf("NEWNYM must not be sent: %v", cmds)
+		}
+	}
+}
+
+// TestApplyExitWarmFails: no warm circuit → previous pin restored (or
+// RESETCONF without one), nothing closed.
+func TestApplyExitWarmFails(t *testing.T) {
+	fp, prev := fpHex(0xAA), fpHex(0xEE)
+	socks := fakeSocks(t, 5) // CONNECT always refused
+	run := func(getconf []string) []string {
+		var mu sync.Mutex
+		var cmds []string
+		c := fakeCtrl(t, func(cmd string) []string {
+			mu.Lock()
+			cmds = append(cmds, cmd)
+			mu.Unlock()
+			if cmd == "GETCONF ExitNodes" {
+				return getconf
+			}
+			return []string{"250 OK"}
+		})
+		closed, err := applyExit(context.Background(), c, socks, fp, "h:443")
+		if err == nil {
+			t.Fatal("applyExit succeeded despite refused warm-up")
+		}
+		if closed != 0 {
+			t.Fatalf("closed = %d, want 0", closed)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return cmds
+	}
+	cmds := run([]string{"250-ExitNodes=$" + prev, "250 OK"})
+	want := []string{"GETCONF ExitNodes", "SETCONF ExitNodes=$" + fp,
+		"SETCONF ExitNodes=$" + prev}
+	if strings.Join(cmds, "|") != strings.Join(want, "|") {
+		t.Fatalf("cmds = %v, want %v", cmds, want)
+	}
+	cmds = run([]string{"250-ExitNodes", "250 OK"})
+	want = []string{"GETCONF ExitNodes", "SETCONF ExitNodes=$" + fp,
+		"RESETCONF ExitNodes"}
+	if strings.Join(cmds, "|") != strings.Join(want, "|") {
+		t.Fatalf("no-prev cmds = %v, want %v", cmds, want)
+	}
+}
+
+// ---------- measure helpers ----------
+
+// TestIsolatedSample: token circuits exit via fp → ok + closed; a token
+// circuit on another exit → errWrongExit, still closed; other users'
+// circuits untouched.
+func TestIsolatedSample(t *testing.T) {
+	fp, other := fpHex(0xAA), fpHex(0xBB)
+	old := speedTestFn
+	defer func() { speedTestFn = old }()
+	var tok string
+	speedTestFn = func(_ context.Context, o probeOpts) (probeResult, error) {
+		tok = o.isolate
+		return probeResult{mbps: 12, url: "u"}, nil
+	}
+	run := func(tokenExit string) (error, []string) {
+		var mu sync.Mutex
+		var cmds []string
+		c := fakeCtrl(t, func(cmd string) []string {
+			mu.Lock()
+			cmds = append(cmds, cmd)
+			mu.Unlock()
+			if cmd == "GETINFO circuit-status" {
+				return []string{"250+circuit-status=",
+					"7 BUILT $" + fpHex(0x01) + "~g,$" + tokenExit +
+						"~e PURPOSE=CONFLUX_LINKED SOCKS_USERNAME=\"" +
+						tok + "\"",
+					"8 BUILT $" + fpHex(0x01) + "~g,$" + other +
+						"~e PURPOSE=GENERAL SOCKS_USERNAME=\"other\"",
+					".", "250 OK"}
+			}
+			return []string{"250 OK"}
+		})
+		_, err := isolatedSample(context.Background(), c, "x", fp,
+			[]string{"u"}, 1, time.Second, "l", nil, 0)
+		mu.Lock()
+		defer mu.Unlock()
+		return err, cmds
+	}
+	err, cmds := run(fp)
+	if err != nil {
+		t.Fatalf("right exit: %v", err)
+	}
+	if strings.Join(cmds, "|") != "GETINFO circuit-status|CLOSECIRCUIT 7" {
+		t.Fatalf("cmds = %v", cmds)
+	}
+	err, cmds = run(other)
+	if err != errWrongExit {
+		t.Fatalf("wrong exit err = %v, want errWrongExit", err)
+	}
+	if strings.Join(cmds, "|") != "GETINFO circuit-status|CLOSECIRCUIT 7" {
+		t.Fatalf("cmds = %v (token circuits must still be closed)", cmds)
+	}
+}
+
+// TestBrowserProbe: a result far below expect re-rolls the no-auth
+// circuits on fp (others untouched) and measures again; max 2 re-rolls.
+func TestBrowserProbe(t *testing.T) {
+	fp, other := fpHex(0xAA), fpHex(0xBB)
+	socks := fakeSocks(t, 0)
+	old := speedTestFn
+	defer func() { speedTestFn = old }()
+	var mu sync.Mutex
+	var cmds []string
+	c := fakeCtrl(t, func(cmd string) []string {
+		mu.Lock()
+		cmds = append(cmds, cmd)
+		mu.Unlock()
+		if cmd == "GETINFO circuit-status" {
+			return []string{"250+circuit-status=",
+				"1 BUILT $" + fpHex(0x01) + "~g,$" + fp + "~e PURPOSE=GENERAL",
+				"2 BUILT $" + fpHex(0x01) + "~g,$" + fp +
+					"~e PURPOSE=GENERAL SOCKS_USERNAME=\"t\"",
+				"3 BUILT $" + fpHex(0x01) + "~g,$" + other +
+					"~e PURPOSE=GENERAL",
+				".", "250 OK"}
+		}
+		return []string{"250 OK"}
+	})
+	var calls int
+	speedTestFn = func(_ context.Context, _ probeOpts) (probeResult, error) {
+		calls++
+		if calls == 1 {
+			return probeResult{mbps: 5}, nil
+		}
+		return probeResult{mbps: 20}, nil
+	}
+	v, err := browserProbe(context.Background(), c, "x", fp, 20,
+		[]string{"u"}, 1, nil, nil)
+	_ = socks
+	if err != nil || v != 20 || calls != 2 {
+		t.Fatalf("v=%v calls=%d err=%v", v, calls, err)
+	}
+	mu.Lock()
+	got := strings.Join(cmds, "|")
+	mu.Unlock()
+	if got != "GETINFO circuit-status|CLOSECIRCUIT 1" {
+		t.Fatalf("cmds = %v – only the no-auth circuit on fp may close", got)
+	}
+	// never more than 2 re-rolls → 3 measurements max
+	mu.Lock()
+	cmds = nil
+	mu.Unlock()
+	calls = 0
+	speedTestFn = func(_ context.Context, _ probeOpts) (probeResult, error) {
+		calls++
+		return probeResult{mbps: 1}, nil
+	}
+	v, _ = browserProbe(context.Background(), c, "x", fp, 20,
+		[]string{"u"}, 1, nil, nil)
+	if calls != 3 || v != 1 {
+		t.Fatalf("calls=%d v=%v – want 3 measurements, last result", calls, v)
+	}
+	mu.Lock()
+	n := 0
+	for _, cmd := range cmds {
+		if strings.HasPrefix(cmd, "CLOSECIRCUIT") {
+			n++
+		}
+	}
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("re-roll closes = %d, want 2", n)
+	}
+}
+
+// ---------- board / boost ----------
+
+func TestBoardAddMean(t *testing.T) {
+	b := newBoard()
+	now := time.Now()
+	b.add("AA", "a", 10, now)
+	b.add("AA", "a", 20, now)
+	if m, n := b.mean("AA"); n != 2 || m != 15 {
+		t.Fatalf("mean = %v n=%d, want 15/2", m, n)
+	}
+	for i := 0; i < 8; i++ {
+		b.add("BB", "b", float64(i), now)
+	}
+	if m, n := b.mean("BB"); n != 6 || m != 4.5 { // newest 6: 2..7
+		t.Fatalf("capped mean = %v n=%d, want 4.5/6", m, n)
+	}
+}
+
+func TestBoardPrune(t *testing.T) {
+	b := newBoard()
+	now := time.Now()
+	b.inc = "INC"
+	b.add("INC", "inc", 10, now)
+	b.add("LOW", "low", 5, now) // 5 < 0.8*10 → cooled
+	b.add("OK", "ok", 9, now)   // kept
+	b.add("OLD", "old", 20, now.Add(-25*time.Minute))
+	b.prune(now)
+	if _, n := b.mean("LOW"); n != 0 {
+		t.Fatal("sub-potential contender not pruned")
+	}
+	if _, ok := b.cool["LOW"]; !ok {
+		t.Fatal("LOW not cooled")
+	}
+	if _, n := b.mean("OK"); n != 1 {
+		t.Fatal("contender with potential pruned")
+	}
+	if _, n := b.mean("OLD"); n != 0 {
+		t.Fatal("expired sample kept")
+	}
+	if _, n := b.mean("INC"); n != 1 {
+		t.Fatal("incumbent pruned")
+	}
+	// expired cool entries are dropped again
+	b.cool["X"] = now.Add(-time.Second)
+	b.prune(now)
+	if _, ok := b.cool["X"]; ok {
+		t.Fatal("expired cool entry kept")
+	}
+}
+
+func TestBoardNext(t *testing.T) {
+	b := newBoard()
+	now := time.Now()
+	b.inc = "INC"
+	b.names["INC"] = "incumbent"
+	pool := []relay{{fp: "INC", name: "incumbent"}, {fp: "P1", name: "p1"},
+		{fp: "P2", name: "p2"}, {fp: "CL", name: "cl"}}
+	// incumbent without samples → retest, on any round
+	if r, ok := b.next(pool, 1, now); !ok || r.fp != "INC" ||
+		r.name != "incumbent" {
+		t.Fatalf("next = %+v ok=%v, want incumbent", r, ok)
+	}
+	b.add("INC", "incumbent", 10, now)
+	b.add("ONE", "one", 12, now) // exactly 1 sample → confirmation first
+	if r, ok := b.next(pool, 1, now); !ok || r.fp != "ONE" {
+		t.Fatalf("next = %+v ok=%v, want ONE", r, ok)
+	}
+	b.add("ONE", "one", 12, now)
+	b.cooldown("CL", now)
+	for i := 0; i < 4; i++ { // rounds 4,7,10,13: not %3 → fresh pool draws
+		r, ok := b.next(pool, 4+3*i, now)
+		if !ok || (r.fp != "P1" && r.fp != "P2") {
+			t.Fatalf("next = %+v ok=%v – only P1/P2 qualify", r, ok)
+		}
+	}
+	b.cooldown("P1", now)
+	b.cooldown("P2", now)
+	if _, ok := b.next(pool, 4, now); ok {
+		t.Fatal("expected no candidate – all fresh relays cooled")
+	}
+	if r, ok := b.next(pool, 3, now); !ok || r.fp != "INC" {
+		t.Fatalf("round 3 = %+v ok=%v, want incumbent retest", r, ok)
+	}
+}
+
+func TestBoardSwitchTo(t *testing.T) {
+	now := time.Now()
+	b := newBoard()
+	b.inc = "INC"
+	b.add("INC", "inc", 10, now)
+	b.add("C", "c", 20, now)
+	if _, ok := b.switchTo(now, now.Add(-time.Hour)); ok {
+		t.Fatal("switched on a single sample")
+	}
+	b.add("C", "c", 20, now)
+	if _, ok := b.switchTo(now, now.Add(-time.Minute)); ok {
+		t.Fatal("switched within the min gap")
+	}
+	if fp, ok := b.switchTo(now, now.Add(-3*time.Minute)); !ok || fp != "C" {
+		t.Fatalf("switchTo = %q %v, want C", fp, ok)
+	}
+	b2 := newBoard()
+	b2.inc = "INC"
+	b2.add("INC", "i", 10, now)
+	b2.add("D", "d", 11, now)
+	b2.add("D", "d", 11, now) // 11 < 1.15*10
+	if _, ok := b2.switchTo(now, now.Add(-time.Hour)); ok {
+		t.Fatal("switched below the ratio")
+	}
+}
+
+func TestBoardSeed(t *testing.T) {
+	b := newBoard()
+	now := time.Now()
+	b.seed("W", 21, []exitScore{
+		{fp: "W", name: "w", vals: []float64{20, 22}, mean: 21},
+		{fp: "L", name: "l", vals: []float64{3}, mean: 3},
+	}, now)
+	if b.incumbent() != "W" {
+		t.Fatalf("inc = %q", b.incumbent())
+	}
+	if m, n := b.mean("W"); m != 21 || n != 2 {
+		t.Fatalf("incumbent mean = %v/%d", m, n)
+	}
+	if _, n := b.mean("L"); n != 0 {
+		t.Fatal("low seed contender should be cooled by prune")
+	}
+}
+
+// TestBoardSwitchToPeak: a degraded incumbent must not be replaced by
+// a contender that only beats the degraded mean – the proven peak is
+// the bar until it decays (peakHold).
+func TestBoardSwitchToPeak(t *testing.T) {
+	now := time.Now()
+	b := newBoard()
+	b.seed("INC", 12.2, []exitScore{
+		{fp: "INC", name: "inc", vals: []float64{12.2}, mean: 12.2},
+	}, now)
+	b.add("INC", "inc", 7.0, now) // congested retest: mean 9.6
+	b.add("W", "worse", 8.7, now)
+	b.add("W", "worse", 8.7, now) // beats 1.15*9.6 but not the peak
+	if fp, ok := b.switchTo(now, now.Add(-time.Hour)); ok {
+		t.Fatalf("switched to worse exit %q below the proven peak", fp)
+	}
+	b.add("G", "good", 13.0, now)
+	b.add("G", "good", 13.0, now) // 13 ≥ 1.15*10.98
+	if fp, ok := b.switchTo(now, now.Add(-time.Hour)); !ok || fp != "G" {
+		t.Fatalf("switchTo = %q %v, want G", fp, ok)
+	}
+	later := now.Add(peakHold + time.Minute)
+	b3 := newBoard()
+	b3.seed("INC", 12.2, nil, now)
+	b3.add("INC", "inc", 7.0, now)
+	b3.add("F", "f", 9.0, now)
+	b3.add("F", "f", 9.0, now) // 9 ≥ 1.15*7 – peak decayed
+	if fp, ok := b3.switchTo(later, now.Add(-time.Hour)); !ok || fp != "F" {
+		t.Fatalf("after peak decay switchTo = %q %v, want F", fp, ok)
+	}
+}
+
+// TestBoardCooldownIncumbent: a failed incumbent retest must never
+// wipe its stats or park it.
+func TestBoardCooldownIncumbent(t *testing.T) {
+	b := newBoard()
+	now := time.Now()
+	b.seed("INC", 10, []exitScore{
+		{fp: "INC", name: "inc", vals: []float64{10}, mean: 10},
+	}, now)
+	b.cooldown("INC", now)
+	if m, n := b.mean("INC"); m != 10 || n != 1 {
+		t.Fatalf("incumbent cooled: mean %v n %d", m, n)
+	}
+	if _, ok := b.cool["INC"]; ok {
+		t.Fatal("incumbent got a cool entry")
+	}
+}
+
+func TestNextBoostInterval(t *testing.T) {
+	if d := nextBoostInterval(0, false); d != 20*time.Second {
+		t.Fatalf("first interval = %v, want 20s", d)
+	}
+	if d := nextBoostInterval(20*time.Second, true); d != 20*time.Second {
+		t.Fatalf("switched interval = %v, want 20s", d)
+	}
+	if d := nextBoostInterval(20*time.Second, false); d != 30*time.Second {
+		t.Fatalf("backoff = %v, want 30s", d)
+	}
+	if d := nextBoostInterval(10*time.Minute, false); d != 5*time.Minute {
+		t.Fatalf("cap = %v, want 5min", d)
+	}
+}
+
+func TestAPIBoost(t *testing.T) {
+	s := newTestServer()
+	rec := httptest.NewRecorder()
+	s.api(rec, httptest.NewRequest(http.MethodPost, "/api/boost?on=1", nil))
+	var m map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatal(err)
+	}
+	// no probe daemon / no pin → preference flips, loop stays off
+	if m["boost_auto"] != true || m["boost"] != false {
+		t.Fatalf("reply = %v", m)
+	}
+	rec = httptest.NewRecorder()
+	s.api(rec, httptest.NewRequest(http.MethodPost, "/api/boost?on=0", nil))
+	m = nil
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["boost_auto"] != false {
+		t.Fatalf("reply = %v", m)
+	}
+	s.mu.Lock()
+	auto := s.boostAuto
+	s.mu.Unlock()
+	if auto {
+		t.Fatal("boost_auto still on")
+	}
+}
+
+// TestFinishHuntCancelledCtx: "stop & keep best" cancels the hunt ctx –
+// the pin must still be applied (warm + sweep + verify on a detached
+// ctx), never restored via RESETCONF.
+func TestFinishHuntCancelledCtx(t *testing.T) {
+	fp := fpHex(0xAA)
+	socks := fakeSocks(t, 0)
+	oldF, oldD := speedTestFn, sweepDelay
+	defer func() { speedTestFn, sweepDelay = oldF, oldD }()
+	sweepDelay = time.Millisecond
+	speedTestFn = func(_ context.Context, _ probeOpts) (probeResult, error) {
+		return probeResult{mbps: 10}, nil
+	}
+	var mu sync.Mutex
+	var cmds []string
+	c := fakeCtrl(t, func(cmd string) []string {
+		mu.Lock()
+		cmds = append(cmds, cmd)
+		mu.Unlock()
+		if cmd == "GETINFO circuit-status" {
+			return []string{"250+circuit-status=", ".", "250 OK"}
+		}
+		return []string{"250 OK"}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // /api/stop, Ctrl+C
+	finishHunt(ctx, c, socks, exitScore{fp: fp, name: "n", mean: 10},
+		"", []string{"u"}, huntOpts{logf: func(string) {}})
+	mu.Lock()
+	got := strings.Join(cmds, "|")
+	mu.Unlock()
+	if !strings.Contains(got, "SETCONF ExitNodes=$"+fp) {
+		t.Fatalf("pin never applied: %v", cmds)
+	}
+	if strings.Contains(got, "RESETCONF") {
+		t.Fatalf("previous pin restored despite warm success: %v", cmds)
+	}
+}
+
+// TestFinishHuntAborted: /api/abort must not pin anything at all.
+func TestFinishHuntAborted(t *testing.T) {
+	fp := fpHex(0xAA)
+	socks := fakeSocks(t, 0)
+	var mu sync.Mutex
+	var cmds []string
+	c := fakeCtrl(t, func(cmd string) []string {
+		mu.Lock()
+		cmds = append(cmds, cmd)
+		mu.Unlock()
+		return []string{"250 OK"}
+	})
+	finishHunt(context.Background(), c, socks,
+		exitScore{fp: fp, name: "n", mean: 10}, "", []string{"u"},
+		huntOpts{logf: func(string) {},
+			aborted: func() bool { return true }})
+	mu.Lock()
+	defer mu.Unlock()
+	for _, cmd := range cmds {
+		if strings.Contains(cmd, "SETCONF") || strings.Contains(cmd, "CLOSECIRCUIT") {
+			t.Fatalf("aborted hunt still touched the daemon: %v", cmds)
+		}
+	}
+}
+
+// ---------- candidate diversity ----------
+
+func TestSubnet24(t *testing.T) {
+	for in, want := range map[string]string{
+		"45.66.35.29":   "45.66.35",
+		"185.220.100.1": "185.220.100",
+		"":              "",
+		"1.2.3":         "", // malformed – never deduped
+		"2001:db8::1":   "", // not an IPv4 r-line address
+	} {
+		if got := subnet24(in); got != want {
+			t.Fatalf("subnet24(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The bandwidth-top pool concentrates operators in a few /24s (measured:
+// 22 of 60 relays inside 45.66.35.0/24). A plain slice probes the same
+// uplink several times; pickDiverse prefers unseen /24s and fills the
+// rest from the leftovers.
+func TestPickDiverse(t *testing.T) {
+	rl := func(ip string) relay { return relay{ip: ip} }
+	pool := []relay{
+		rl("45.66.35.10"), rl("45.66.35.11"), rl("45.66.35.12"),
+		rl("185.220.100.1"), rl("185.220.100.2"),
+		rl("9.9.9.9"), rl("8.8.8.8"), rl("7.7.7.7"),
+	}
+	want4 := []string{"45.66.35.10", "185.220.100.1", "9.9.9.9", "8.8.8.8"}
+	got := pickDiverse(pool, 4)
+	if len(got) != len(want4) {
+		t.Fatalf("len = %d, want %d", len(got), len(want4))
+	}
+	for i := range want4 {
+		if got[i].ip != want4[i] {
+			t.Fatalf("pick %d = %s, want %s (got %v)", i, got[i].ip, want4[i], got)
+		}
+	}
+	got = pickDiverse(pool, 6)
+	if len(got) != 6 || got[5].ip != "45.66.35.11" {
+		t.Fatalf("leftover fill wrong: %v", got)
+	}
+	// relays without a parseable IP are never deduplicated
+	if got := pickDiverse([]relay{rl(""), rl(""), rl("")}, 2); len(got) != 2 {
+		t.Fatalf("empty-IP relays deduped: %v", got)
+	}
+}
+
+// ---------- pin health ----------
+
+func TestIsFP(t *testing.T) {
+	for s, want := range map[string]bool{
+		fpHex(0xAA):                  true,
+		strings.ToLower(fpHex(0xAA)): true,
+		"{de}":                       false,
+		"DEADBEEF":                   false,
+		"":                           false,
+		fpHex(0xAA) + "00":           false,
+	} {
+		if isFP(s) != want {
+			t.Fatalf("isFP(%q) = %v, want %v", s, !want, want)
+		}
+	}
+}
+
+// pinCheck must release the pin only when the relay is provably unusable
+// (gone from the consensus, not Running, BadExit). Anything it cannot
+// judge – {de} pins, missing directory data, malformed replies – is left
+// alone: a transient gap must never drop a working pin.
+func TestPinCheck(t *testing.T) {
+	fp := fpHex(0x33)
+	ns := func(flags string) []string {
+		return []string{
+			"250+ns/id/" + fp + "=",
+			"r Some " + b64fp(0x33) + " dGVzdA 2025-01-01 12:00:00 1.2.3.4 443 0",
+			"s " + flags,
+			".",
+			"250 OK",
+		}
+	}
+	dirOK := []string{"250-status/enough-dir-info=1", "250 OK"}
+	ctrl := func(dir []string, nsr []string) (*ctrl, *[]string) {
+		var cmds []string
+		return fakeCtrl(t, func(cmd string) []string {
+			cmds = append(cmds, cmd)
+			switch cmd {
+			case "GETINFO status/enough-dir-info":
+				return dir
+			case "GETINFO ns/id/" + fp:
+				return nsr
+			}
+			return []string{"250 OK"}
+		}), &cmds
+	}
+
+	c, _ := ctrl(dirOK, ns("Exit Fast Running Stable Valid"))
+	if ok, why := pinCheck(c, fp); !ok {
+		t.Fatalf("healthy pin unusable: %s", why)
+	}
+
+	// tor answers 552 for relays missing from the consensus – readReply
+	// treats it as a completed reply, so the missing "r" line is the signal.
+	c, _ = ctrl(dirOK, []string{"552 Unrecognized key"})
+	if ok, why := pinCheck(c, fp); ok || why == "" {
+		t.Fatalf("dead pin kept: ok=%v why=%q", ok, why)
+	}
+
+	c, _ = ctrl(dirOK, ns("Exit BadExit Running Valid"))
+	if ok, why := pinCheck(c, fp); ok || why == "" {
+		t.Fatalf("BadExit pin kept: ok=%v why=%q", ok, why)
+	}
+
+	c, _ = ctrl(dirOK, ns("Exit Valid"))
+	if ok, why := pinCheck(c, fp); ok || why == "" {
+		t.Fatalf("not-Running pin kept: ok=%v why=%q", ok, why)
+	}
+
+	// tor still fetching directory data → don't judge, don't even ask.
+	c, cmds := ctrl([]string{"250-status/enough-dir-info=0", "250 OK"}, nil)
+	if ok, _ := pinCheck(c, fp); !ok {
+		t.Fatal("no dir info yet – pin dropped")
+	}
+	for _, cmd := range *cmds {
+		if strings.HasPrefix(cmd, "GETINFO ns/") {
+			t.Fatalf("queried ns/id without dir info: %v", *cmds)
+		}
+	}
+
+	// {de} / lists / whatever the user set themselves – never touched.
+	c, cmds = ctrl(dirOK, nil)
+	if ok, _ := pinCheck(c, "{de}"); !ok {
+		t.Fatal("country pin judged")
+	}
+	if len(*cmds) != 0 {
+		t.Fatalf("country pin triggered control commands: %v", *cmds)
+	}
+
+	// reply without flags → can't judge → keep.
+	c, _ = ctrl(dirOK, []string{
+		"250+ns/id/" + fp + "=",
+		"r Some " + b64fp(0x33) + " dGVzdA 2025-01-01 12:00:00 1.2.3.4 443 0",
+		".",
+		"250 OK",
+	})
+	if ok, _ := pinCheck(c, fp); !ok {
+		t.Fatal("flagless reply dropped the pin")
+	}
+}
+
+// fakeCtrlServer runs a scripted tor control port on a real loopback
+// listener (null auth) for code paths that dial via daemon.connect().
+// respond must be goroutine-safe.
+func fakeCtrlServer(t *testing.T, respond func(cmd string) []string) *daemon {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				r := bufio.NewReader(c)
+				for {
+					l, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					for _, out := range respond(strings.TrimRight(l, "\r\n")) {
+						if _, err := c.Write([]byte(out + "\r\n")); err != nil {
+							return
+						}
+					}
+				}
+			}(conn)
+		}
+	}()
+	return &daemon{addr: ln.Addr().String()}
+}
+
+// cmdLog records control commands (mutex-guarded).
+type cmdLog struct {
+	mu   sync.Mutex
+	cmds []string
+}
+
+func (l *cmdLog) add(cmd string) {
+	l.mu.Lock()
+	l.cmds = append(l.cmds, cmd)
+	l.mu.Unlock()
+}
+
+func (l *cmdLog) has(prefix string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, c := range l.cmds {
+		if strings.HasPrefix(c, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *cmdLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.cmds, " | ")
+}
+
+// huntScript answers what hunt() asks: a SOCKS listener, a two-exit
+// consensus, "250 OK" for everything else.
+func huntScript(log *cmdLog) func(string) []string {
+	return func(cmd string) []string {
+		log.add(cmd)
+		switch cmd {
+		case "GETINFO net/listeners/socks":
+			return []string{`250-net/listeners/socks="127.0.0.1:9"`, "250 OK"}
+		case "GETINFO ns/all":
+			return []string{"250+ns/all=",
+				"r ExitA " + b64fp(0xA1) + " dGVzdA 2025-01-01 12:00:00 1.1.1.1 443 0",
+				"s Exit Fast Running Valid", "w Bandwidth=9000", "p accept 80,443",
+				"r ExitB " + b64fp(0xB2) + " dGVzdA 2025-01-01 12:00:00 2.2.2.2 443 0",
+				"s Exit Fast Running Valid", "w Bandwidth=8000", "p accept 80,443",
+				".", "250 OK"}
+		}
+		return []string{"250 OK"}
+	}
+}
+
+// A hunt that finds no usable exit must leave the browsing pin alone when
+// it measured on the probe daemon – a probe-side outage must not drop the
+// user's working pin. In-place hunts pinned every candidate on the
+// browsing daemon, so there random selection has to be restored.
+func TestHuntNoUsableExitPin(t *testing.T) {
+	old := speedTestFn
+	defer func() { speedTestFn = old }()
+	speedTestFn = func(context.Context, probeOpts) (probeResult, error) {
+		return probeResult{}, io.ErrUnexpectedEOF // every sample fails
+	}
+	opts := func(probe *daemon) huntOpts {
+		return huntOpts{candidates: 2, samples: 1, maxMB: 1,
+			url: "http://127.0.0.1/f", probe: probe, logf: func(string) {}}
+	}
+
+	var bl, pl cmdLog
+	browse := fakeCtrlServer(t, huntScript(&bl))
+	probe := fakeCtrlServer(t, huntScript(&pl))
+	if best, _ := hunt(context.Background(), browse, opts(probe)); best.fp != "" {
+		t.Fatalf("best = %+v, want none", best)
+	}
+	if !pl.has("SETCONF ExitNodes=$") {
+		t.Fatalf("candidates never pinned on the probe: %s", &pl)
+	}
+	if bl.has("SETCONF ExitNodes") || bl.has("RESETCONF ExitNodes") {
+		t.Fatalf("probe hunt touched the browsing pin: %s", &bl)
+	}
+
+	var il cmdLog
+	inPlace := fakeCtrlServer(t, huntScript(&il))
+	hunt(context.Background(), inPlace, opts(nil))
+	if !il.has("RESETCONF ExitNodes") {
+		t.Fatalf("in-place hunt left the last candidate pinned: %s", &il)
+	}
+}
+
+// The watchdog action: a provably dead pin is released, only circuits
+// through that exit are closed, and boost (whose incumbent is gone)
+// stops. A healthy pin – or one a hunt/boost just replaced – stays.
+func TestReleaseDeadPin(t *testing.T) {
+	fp, other := fpHex(0xDD), fpHex(0xEE)
+	mid := "$" + fpHex(0x11) + "~mid"
+	script := func(log *cmdLog, nsReply []string, current string) func(string) []string {
+		return func(cmd string) []string {
+			log.add(cmd)
+			switch cmd {
+			case "GETINFO status/enough-dir-info":
+				return []string{"250-status/enough-dir-info=1", "250 OK"}
+			case "GETINFO ns/id/" + fp:
+				return nsReply
+			case "GETCONF ExitNodes":
+				return []string{"250-ExitNodes=$" + current, "250 OK"}
+			case "GETINFO circuit-status":
+				return []string{"250+circuit-status=",
+					"1 BUILT " + mid + ",$" + fp + "~dead PURPOSE=GENERAL",
+					"2 BUILT " + mid + ",$" + other + "~ok PURPOSE=GENERAL",
+					"3 BUILT " + mid + ",$" + fp + "~dead PURPOSE=CONFLUX_LINKED",
+					".", "250 OK"}
+			}
+			return []string{"250 OK"}
+		}
+	}
+	gone := []string{`552 Unrecognized key "ns/id/` + fp + `"`}
+
+	var l1 cmdLog
+	s := newTestServer()
+	cancelled := false
+	s.boosting, s.boostCancel = true, func() { cancelled = true }
+	if !s.releaseDeadPin(fakeCtrl(t, script(&l1, gone, fp)), fp) {
+		t.Fatalf("dead pin kept: %s", &l1)
+	}
+	for _, want := range []string{"RESETCONF ExitNodes", "CLOSECIRCUIT 1", "CLOSECIRCUIT 3"} {
+		if !l1.has(want) {
+			t.Fatalf("missing %q: %s", want, &l1)
+		}
+	}
+	if l1.has("CLOSECIRCUIT 2") {
+		t.Fatalf("closed a circuit on a healthy exit: %s", &l1)
+	}
+	if s.boosting || !cancelled {
+		t.Fatal("boost still running on a released incumbent")
+	}
+
+	// a hunt/boost re-pinned meanwhile → never clobber the new pin
+	var l2 cmdLog
+	if newTestServer().releaseDeadPin(fakeCtrl(t, script(&l2, gone, other)), fp) ||
+		l2.has("RESETCONF") {
+		t.Fatalf("replaced pin released: %s", &l2)
+	}
+
+	var l3 cmdLog
+	healthy := []string{"250+ns/id/" + fp + "=",
+		"r Ok " + b64fp(0xDD) + " dGVzdA 2025-01-01 12:00:00 1.2.3.4 443 0",
+		"s Exit Fast Running Valid", ".", "250 OK"}
+	s3 := newTestServer()
+	s3.boosting = true
+	if s3.releaseDeadPin(fakeCtrl(t, script(&l3, healthy, fp)), fp) ||
+		l3.has("RESETCONF") || l3.has("CLOSECIRCUIT") || !s3.boosting {
+		t.Fatalf("healthy pin released: %s", &l3)
+	}
+}
+
+// Brave's tor component on Windows has no .exe suffix
+// (…\User Data\<component-id>\<version>\tor-0.4.9.14-win32-brave-0) –
+// an *.exe glob left the probe daemon unspawnable.
+func TestTorBinaryBraveWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows component layout")
+	}
+	root := t.TempDir()
+	dir := filepath.Join(root, "BraveSoftware", "Brave-Browser", "User Data",
+		"cpoalefficncklhjfpglfiplenlpccdb", "1.0.50")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(dir, "tor-0.4.9.14-win32-brave-0")
+	for _, f := range []string{exe, filepath.Join(dir, "tor-torrc")} {
+		if err := os.WriteFile(f, nil, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", "")
+	t.Setenv("LOCALAPPDATA", root)
+	if got := torBinary(); got != exe {
+		t.Fatalf("torBinary() = %q, want %q", got, exe)
 	}
 }

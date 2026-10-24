@@ -129,6 +129,22 @@ test('onProxyError burst: at most one status fetch per 5 s',async()=>{
  await sleep(30);
  assert.ok(w.calls.fetch<=1,`fetch count ${w.calls.fetch} > 1`);});
 
+test('toggle off during in-flight sync: stays off, no stale re-set',async()=>{
+ const w=await world();w.setFetch(ok);
+ w.store.on=true;
+ const p=w.bg.syncProxy();
+ await w.send({proxy:false});
+ await p;
+ assert.equal(w.controlled(),false,'stale sync must not re-install PAC');
+ assert.equal(w.store.on,false);});
+
+test('replies carry gen: newer toggle wins over stale sync',async()=>{
+ const w=await world();w.setFetch(ok);
+ const r1=await w.send({proxy:true});
+ const r2=await w.send({proxy:false});
+ assert.ok(r1.gen<r2.gen,'gen must increase per intent change');
+ assert.equal(r2.on,false);});
+
 test('set() rejected by another extension: on:false + error',async()=>{
  const w=await world();w.setFetch(ok);w.setThrow(true);
  const r=await w.send({proxy:true});

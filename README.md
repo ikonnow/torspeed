@@ -33,12 +33,41 @@ native host auto-starts `torspeed --serve` (API + dashboard on
 ### Find fastest exit
 
 `torspeed --hunt` or the **Find fastest exit** button: probes exit
-candidates, measures each on a fresh circuit, pins the winner
+candidates drawn at random from the top-60 exits — preferring **distinct
+/24 subnets**, since the bandwidth-top pool concentrates a few operators
+on shared uplinks — measures each on a fresh circuit, pins the winner
 (`SETCONF ExitNodes`) and closes the stale circuits so open tabs switch
-automatically — no reload needed. Takes a few minutes; **Stop & keep
-best** ends it early with the best found so far. A `--target 15` value
-stops as soon as 15 Mbit/s is reached. Feeling slow again later? Exits
-are shared — re-run the hunt.
+automatically — no reload needed. While `--serve` runs, measuring happens
+on a **dedicated probe tor daemon** (spawned automatically, per-user data
+dir `~/.torspeed/probe`), so the per-candidate re-pinning never touches
+the browser's circuits — **your browsing is not interrupted** during a
+hunt. The winner is applied gracefully: the new exit's circuit is warmed
+up first, then old-exit circuits are swept — and a 10 s watcher keeps
+sweeping late stragglers while a pin is active. Every 60 s it also
+health-checks the pin: `ExitNodes` is strict, so a pinned relay that left
+the consensus, lost `Running` or gained `BadExit` is **released**
+automatically instead of leaving the browser without exit circuits.
+Takes a few minutes;
+**Stop & keep best** ends it early with the best found so far. A
+`--target 15` value stops as soon as 15 Mbit/s is reached. Feeling slow
+again later? Exits are shared — that's what the boost below is for.
+
+### Keep improving (boost)
+
+After a successful hunt torspeed keeps searching **in the background**
+(on by default, toggle in the popup/dashboard or
+`POST /api/boost?on=0|1`). While you surf, the probe daemon keeps
+sampling exits: the pinned incumbent is re-tested regularly (it rots
+too), promising contenders get a confirmation probe, and a contender only
+replaces the pin when its confirmed mean is ≥15 % better — applied
+gracefully, warm circuit first. Exits without potential or with expired
+samples are dropped and cooled for 30 min.
+
+Budget-friendly: ≤10 MB per probe, interval backs off 20 s → 5 min
+(×1.5 per round), and boost stops itself after 60 min without an
+improvement. It pauses while a hunt or measurement runs and stops on
+unpin, abort or daemon switch. Status shows `boost_probes` /
+`boost_switches`.
 
 ### Route browser via Tor
 
@@ -105,9 +134,10 @@ routing (needs the extension API), plus the full log.
 | Tor daemon | Select the active daemon; ` (not ready)` marks dead ones; **Compare** races them |
 | Route browser via Tor | Fail-closed browser routing (above); warns `No Tor daemon reachable` when it can't work |
 | System proxy → Tor | System-wide SOCKS proxy for proxy-aware apps |
+| Keep improving in background | Boost: keeps searching for a better exit after a hunt (probe counts show in the probe line) |
 | Find fastest exit / Stop & keep best | Start a hunt / end it keeping the best |
 | Unpin exit / Cancel (unpin) | Remove the pin / abort the hunt and unpin |
-| Measure | One-shot speed test on the active daemon (disabled while hunting) |
+| Measure | One-shot speed test on the browser's real circuit — clearly below the pinned score → the circuit is re-rolled and re-measured (disabled while hunting) |
 
 ## CLI reference
 
@@ -152,11 +182,20 @@ routing (needs the extension API), plus the full log.
   reused for later samples; two consecutive failures fall back to the
   full list. Slow samples are aborted early (well below the current
   best) and converged rates stop the download.
+- **Conflux:** tor 0.4.8+ builds linked circuit pairs — every sample's
+  circuits are verified against the pinned candidate afterwards (a stale
+  conflux set can otherwise carry the previous exit) and always closed
+  again, so samples never leak onto the wrong exit or linger around.
+- **Probe daemon:** `--serve` spawns a second, private tor
+  (`~/.torspeed/probe`, auto ports) that does all candidate measuring —
+  `SETCONF ExitNodes` there never abandons the browser's circuits.
 - **Pinning:** `SETCONF ExitNodes=$FP` — transient, resets on Tor
-  restart. Then every `BUILT` general-purpose circuit whose last hop is
-  not the winner gets `CLOSECIRCUIT`, so even keep-alive/HTTP/2
-  connections move to the pinned exit immediately. `SIGNAL NEWNYM` and a
-  verification probe follow.
+  restart. The new exit is warmed with a no-auth connect (same isolation
+  class as the browser's PAC traffic), *then* every `BUILT`
+  general-purpose circuit whose last hop is not the winner gets
+  `CLOSECIRCUIT`, so even keep-alive/HTTP/2 connections move to the
+  pinned exit immediately — no reload, no `NEWNYM`. A 10 s watcher
+  sweeps late conflux stragglers while a pin is active.
 - **Baseline:** a short direct (non-Tor) probe runs once at first status
   poll and after every hunt/measure — that's the `direct Y Mbit/s`
   reference. It is throttled (≥10 min apart) and never overlaps a hunt.
@@ -176,8 +215,8 @@ routing (needs the extension API), plus the full log.
 ## Updating
 
 Re-run `torspeed --install-ext` and reload the extension in
-`brave://extensions` — API routes changed in v0.5 (`/api/vpn` →
-`/api/proxy`, `/api/versus` → `/api/compare`).
+`brave://extensions` — v0.6 adds the boost toggle (`/api/boost`); older
+popups keep working, they just don't show the switch.
 
 ## Development
 
@@ -198,8 +237,6 @@ checks first.
   should auto-start `--serve`; check `curl http://127.0.0.1:8765/api/status`.
 - **Extension won't load:** `brave://extensions` shows the card error;
   re-run `--install-ext` so manifest and files match the binary version.
-- **A page hangs right after a pin:** rare leftover connection — reload
-  the page once.
 - **`No Tor daemon reachable`:** browser routing is on but no ready
   daemon was found — start one (`torspeed --start-tor`) or open a Tor
   window.
