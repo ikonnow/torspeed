@@ -59,9 +59,11 @@ After a successful hunt torspeed keeps searching **in the background**
 `POST /api/boost?on=0|1`). While you surf, the probe daemon keeps
 sampling exits: the pinned incumbent is re-tested regularly (it rots
 too), promising contenders get a confirmation probe, and a contender only
-replaces the pin when its confirmed mean is ≥15 % better — applied
-gracefully, warm circuit first. Exits without potential or with expired
-samples are dropped and cooled for 30 min.
+replaces the pin when its confirmed mean is ≥15 % better **than the
+incumbent's proven peak** (decaying after 30 min) — a congested retest
+can never hand the pin to a worse exit. Applied gracefully, warm circuit
+first. Exits without potential or with expired samples are dropped and
+cooled for 30 min.
 
 Budget-friendly: ≤10 MB per probe, interval backs off 20 s → 5 min
 (×1.5 per round), and boost stops itself after 60 min without an
@@ -171,8 +173,10 @@ routing (needs the extension API), plus the full log.
   resolves each daemon's SOCKS port and readiness
   (`status/circuit-established`).
 - **Candidates:** random draw from the top-60 `Exit`+`Running` relays
-  whose exit policy covers ports 80 **and** 443; `BadExit` relays are
-  skipped and missing policies are resolved lazily via `md/id`.
+  whose exit policy covers ports 80 **and** 443, preferring distinct
+  /24 subnets (the pool concentrates a few operators on shared uplinks);
+  `BadExit` relays are skipped and missing policies are resolved lazily
+  via `md/id`.
 - **Measurement:** up to 3 parallel download streams over SOCKS5 (a single
   Tor stream is window-limited; browsers use many). Each sample gets a
   random SOCKS username → `IsolateSOCKSAuth` builds a **fresh circuit**
@@ -241,7 +245,8 @@ checks first.
   daemon was found — start one (`torspeed --start-tor`) or open a Tor
   window.
 - **Raw API:** `curl -X POST http://127.0.0.1:8765/api/measure`,
-  `/api/hunt`, `/api/stop`, `/api/unpin`, `/api/compare`.
+  `/api/hunt`, `/api/stop`, `/api/unpin`, `/api/compare`,
+  `/api/boost?on=0|1`, `/api/daemon?addr=…`.
 
 ## Platforms
 
