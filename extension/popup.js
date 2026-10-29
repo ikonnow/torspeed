@@ -41,7 +41,8 @@ const renderBig=()=>{
  if(!hunting){if(anim)cancelAnimationFrame(anim);anim=0;shownV=0;
   S.classList.remove('hunt');SV.textContent=live;
   $('cap').textContent=L.cap;LV.style.display='none';return;}
- S.classList.add('hunt');
+ // green only while a running probe beats the leading settled score
+ S.classList.toggle('hunt',liveProbe.v>huntBest.v);
  SV.textContent=shownV?shownV.toFixed(1):'–';
  $('cap').textContent=shownV?L.fast+truthName():L.search;
  LV.textContent=L.live+live+' Mbit/s';LV.style.display='';};

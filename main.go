@@ -1738,18 +1738,20 @@ func hunt(ctx context.Context, d *daemon, o huntOpts) (best exitScore, results [
 				sampleURLs = []string{known}
 			}
 		}
-		if len(vals) == 0 {
-			if ctx.Err() == nil {
-				o.logf(head + fmt.Sprintf("failed (%s)", lastErr))
-				if known != "" {
-					if knownFails++; knownFails >= 2 {
-						known, knownFails = "", 0
-						o.logf("known test URL failing – back to the full list")
-					}
-				}
-				continue
-			}
+		// Stopped mid-candidate: a partial mean is unverified – only
+		// fully measured candidates may win (stop keeps the true best).
+		if len(vals) < o.samples && ctx.Err() != nil {
 			break
+		}
+		if len(vals) == 0 {
+			o.logf(head + fmt.Sprintf("failed (%s)", lastErr))
+			if known != "" {
+				if knownFails++; knownFails >= 2 {
+					known, knownFails = "", 0
+					o.logf("known test URL failing – back to the full list")
+				}
+			}
+			continue
 		}
 		knownFails = 0
 		// Mean of the samples: the browser will use random middles
@@ -2808,7 +2810,10 @@ func (s *server) boostLoop(ctx context.Context, gen int) {
 			if cand.fp == bd.incumbent() {
 				m, _ := bd.mean(cand.fp)
 				s.mu.Lock()
-				s.bestMB, s.bestAt = m, time.Now().Unix()
+				// peak only – a congested retest must not lower "best"
+				if m > s.bestMB {
+					s.bestMB, s.bestAt = m, time.Now().Unix()
+				}
 				s.mu.Unlock()
 			}
 		}
@@ -3137,7 +3142,8 @@ const renderBig=()=>{
   speed.classList.remove('hunt');
   speed.innerHTML=live+' <small>Mbit/s</small>';
   cap.textContent='live traffic · Mbit/s';lv.style.display='none';return;}
- speed.classList.add('hunt');
+ // green only while a running probe beats the leading settled score
+ speed.classList.toggle('hunt',liveProbe.v>huntBest.v);
  speed.textContent=shownV?shownV.toFixed(1):'–';
  cap.textContent=shownV?'fastest so far · Mbit/s — '+truthName()
   :'searching…';

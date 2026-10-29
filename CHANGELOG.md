@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Hunt display: the big number only turns green while a running probe
+  exceeds the leading settled score – a spike you can actually act on.
+- Stopping a hunt mid-candidate now discards that candidate's partial
+  samples: only fully measured candidates can be pinned, so "Stop &
+  keep best" always keeps the best *verified* exit.
+- `best_mbps` is a true peak again – a degraded incumbent retest no
+  longer overwrites it with a lower value.
+
 ## v0.6
 
 - Hunts measure on a dedicated probe tor daemon (`~/.torspeed/probe`,
