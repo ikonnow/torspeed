@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Security: the local API no longer answers arbitrary web pages. The
+  wildcard CORS header is gone (only the torspeed extension gets CORS),
+  requests with a foreign `Origin` or a non-loopback `Host` (DNS
+  rebinding) are rejected with 403, and every endpoint except
+  `/api/status` requires POST. The printed bookmarklet was removed – it
+  relied on cross-site access.
 - Hunt display: the big number only turns green while a running probe
   exceeds the leading settled score – a spike you can actually act on.
 - Stopping a hunt mid-candidate now discards that candidate's partial
