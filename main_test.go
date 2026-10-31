@@ -739,16 +739,80 @@ func TestAPIStatus(t *testing.T) {
 func TestAPIOptions(t *testing.T) {
 	s := newTestServer()
 	rec := httptest.NewRecorder()
-	s.api(rec, httptest.NewRequest(http.MethodOptions, "/api/status", nil))
-	if rec.Header().Get("Access-Control-Allow-Origin") != "*" {
-		t.Fatal("missing CORS header")
+	req := httptest.NewRequest(http.MethodOptions, "/api/status", nil)
+	req.Header.Set("Origin", extOrigin)
+	s.api(rec, req)
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != extOrigin {
+		t.Fatalf("CORS origin = %q, want %q", got, extOrigin)
+	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	req.Header.Set("Origin", "https://evil.example")
+	s.api(rec, req)
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("foreign origin got CORS header %q", got)
+	}
+}
+
+func TestAPIMutationsRequirePost(t *testing.T) {
+	s := newTestServer()
+	called := false
+	old := proxySetFn
+	proxySetFn = func(bool, string) error { called = true; return nil }
+	defer func() { proxySetFn = old }()
+	for _, p := range []string{"/api/proxy?on=0", "/api/hunt", "/api/unpin",
+		"/api/open", "/api/daemon?addr=x", "/api/boost?on=1"} {
+		rec := httptest.NewRecorder()
+		s.api(rec, httptest.NewRequest(http.MethodGet, p, nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("GET %s = %d, want 405", p, rec.Code)
+		}
+	}
+	if called {
+		t.Fatal("GET /api/proxy reached proxySetFn")
+	}
+}
+
+func TestLocalGuard(t *testing.T) {
+	ok := localGuard(8765, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	for _, c := range []struct {
+		host, origin, site, mode string
+		want                     int
+	}{
+		{"127.0.0.1:8765", "", "", "", 200},                      // curl
+		{"localhost:8765", "", "same-origin", "cors", 200},       // dashboard GET
+		{"127.0.0.1:8765", "http://127.0.0.1:8765", "", "", 200}, // dashboard POST
+		{"127.0.0.1:8765", extOrigin, "", "", 200},
+		{"127.0.0.1:8765", "", "cross-site", "navigate", 200}, // user opens a link
+		{"127.0.0.1:8765", "https://evil.example", "", "", 403},
+		{"127.0.0.1:8765", "null", "", "", 403},
+		{"127.0.0.1:8765", "http://127.0.0.1:9999", "", "", 403},
+		{"127.0.0.1:8765", "chrome-extension://otherextensionid", "", "", 403},
+		{"127.0.0.1:8765", "", "cross-site", "no-cors", 403}, // <img src>
+		{"evil.example:8765", "", "", "", 403},               // DNS rebinding
+		{"127.0.0.1:9999", "", "", "", 403},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/proxy?on=0", nil)
+		req.Host = c.host
+		if c.origin != "" {
+			req.Header.Set("Origin", c.origin)
+		}
+		if c.site != "" {
+			req.Header.Set("Sec-Fetch-Site", c.site)
+			req.Header.Set("Sec-Fetch-Mode", c.mode)
+		}
+		rec := httptest.NewRecorder()
+		ok.ServeHTTP(rec, req)
+		if rec.Code != c.want {
+			t.Errorf("%+v: code %d, want %d", c, rec.Code, c.want)
+		}
 	}
 }
 
 func TestAPINotFound(t *testing.T) {
 	s := newTestServer()
 	rec := httptest.NewRecorder()
-	s.api(rec, httptest.NewRequest(http.MethodGet, "/api/bogus", nil))
+	s.api(rec, httptest.NewRequest(http.MethodPost, "/api/bogus", nil))
 	if rec.Code != 404 {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}

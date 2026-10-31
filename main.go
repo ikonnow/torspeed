@@ -2857,10 +2857,58 @@ func (s *server) boostLoop(ctx context.Context, gen int) {
 	}
 }
 
+// extOrigin is the only cross-origin caller allowed to use the local API.
+const extOrigin = "chrome-extension://" + extID
+
+// localGuard admits only the dashboard itself, the torspeed extension and
+// non-browser clients (curl). The Host check defeats DNS rebinding; the
+// Origin / Sec-Fetch-Site checks stop any other web page from driving or
+// reading the API.
+func localGuard(port int, h http.Handler) http.Handler {
+	hosts := map[string]bool{
+		fmt.Sprintf("127.0.0.1:%d", port): true,
+		fmt.Sprintf("localhost:%d", port): true,
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !hosts[strings.ToLower(r.Host)] {
+			http.Error(w, "forbidden host", http.StatusForbidden)
+			return
+		}
+		if o := r.Header.Get("Origin"); o != "" {
+			if o != extOrigin && !(strings.HasPrefix(o, "http://") &&
+				hosts[strings.ToLower(strings.TrimPrefix(o, "http://"))]) {
+				http.Error(w, "forbidden origin", http.StatusForbidden)
+				return
+			}
+		} else if fs := r.Header.Get("Sec-Fetch-Site"); (fs == "cross-site" ||
+			fs == "same-site") && r.Header.Get("Sec-Fetch-Mode") != "navigate" {
+			// Origin-less cross-site subresource loads (<img>, <script>).
+			http.Error(w, "forbidden origin", http.StatusForbidden)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// allowExtCORS grants the extension (and only it) cross-origin access.
+func allowExtCORS(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Vary", "Origin")
+	if r.Header.Get("Origin") == extOrigin {
+		w.Header().Set("Access-Control-Allow-Origin", extOrigin)
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+	}
+}
+
 func (s *server) api(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+	allowExtCORS(w, r)
 	if r.Method == "OPTIONS" {
+		return
+	}
+	// Everything but the status read changes state: POST only, so a
+	// plain link or <img> can never trigger it.
+	if r.URL.Path != "/api/status" && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST, OPTIONS")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	switch r.URL.Path {
@@ -3042,7 +3090,7 @@ func (s *server) api(w http.ResponseWriter, r *http.Request) {
 func (s *server) events(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	allowExtCORS(w, r)
 	fl, ok := w.(http.Flusher)
 	if !ok {
 		return
@@ -3284,8 +3332,8 @@ func (s *server) run(port int) error {
 	mux.HandleFunc("/events", s.events)
 	mux.HandleFunc("/api/", s.api)
 	fmt.Printf("Dashboard: http://127.0.0.1:%d\n", port)
-	fmt.Printf("Bookmarklet: javascript:fetch('http://127.0.0.1:%d/api/hunt',{method:'POST'})\n", port)
-	srv := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", port), Handler: mux}
+	srv := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", port),
+		Handler: localGuard(port, mux)}
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)
 	defer stop()
